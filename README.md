@@ -1,47 +1,113 @@
-# Coordinator Build Kit
+# agent-coordination-skills
 
-A drop-in kit that turns a GitHub Copilot agent into the **builder** of the
-`agent-coordination-skills` repo. You commit these files to an empty repo, paste the kickoff
-prompt, and Copilot ships the whole thing — staying on-spec because the kit constrains it.
+A drop-in coordination layer for running **multiple GitHub Copilot agent sessions in parallel
+on one repository** — without them stalling, drifting, clobbering each other's branches, or
+acting on stale cross-session messages.
 
-## What's in here
+It ships two coordination modes and is opinionated about when to use each:
 
-| File | Role |
+- **Native mode (preferred): hub-and-spoke.** One *orchestrator* agent delegates scoped work
+  to *worker* sub-agents that run in isolated contexts and report back through Copilot's native
+  sub-agent lifecycle. Coordination is vertical (parent ↔ child), so there is no lateral
+  peer-messaging problem to solve.
+- **Fallback mode: filesystem control plane.** For genuine long-running *peer* sessions that
+  are **not** in a parent/child tree, sessions coordinate through a shared on-disk control
+  plane (`.coordination/`) they read at defined checkpoints. This mode exists because peer
+  sessions have no preemption and no delivery guarantees.
+
+The guiding idea: **invariants live in tooling, not prose.** Instructions *teach* the protocol;
+the `coord` CLI, the hooks, and git *enforce* it — so a model under context pressure can't skip
+them. See [`docs/architecture.md`](docs/architecture.md) for the full design.
+
+## Which mode should I use?
+
+| Situation | Mode |
 |---|---|
-| `SPEC.md` | **Source of truth.** Architecture, file manifest, component contracts, acceptance criteria. |
-| `BUILD_PLAN.md` | Phased, checkpointed task plan the agent executes one phase at a time. |
-| `KICKOFF.md` | The prompt you paste to start the build session. |
-| `.github/copilot-instructions.md` | Standing guardrails the agent always reads (anti-drift, verify-don't-assert). |
-| `reference/coord.reference.py` | **Tested, locked** control-plane implementation the agent must use verbatim. |
-| `reference/ACCEPTANCE.md` | The exact scenarios (with real transcripts) the build must reproduce as tests. |
+| One driver decomposing work into scoped slices | **Native** hub-and-spoke |
+| Sub-agents that live and die inside one parent run | **Native** |
+| Two+ independent, long-lived sessions started separately | **Fallback** control plane |
+| Peers that must survive many turns and periodically re-sync | **Fallback** |
 
-## How to use it
+When in doubt, start native. Reach for the control plane only when you have true peers.
 
-1. Create the empty GitHub repo and connect it to Copilot.
-2. Commit the contents of this kit to the repo root (keep the `.github/` and `reference/`
-   paths as-is).
-3. Open a Copilot agent session with edit + bash tools on the repo.
-4. Paste `KICKOFF.md` into the session.
-5. The agent builds **Phase 0**, stops, and reports. Review, then tell it to continue. Repeat
-   through Phase 7. It opens a PR at the end — you review and merge.
+## Requirements
 
-## Why it's shaped this way
+- **Python 3.8+** (standard library only — no third-party runtime dependencies).
+- **pytest** only if you want to run the test suite (a dev dependency).
+- The `sessionStart` hook auto-registers a session via `bash`; on Windows that means Git Bash
+  (see [`hooks/README.md`](hooks/README.md)). Everything else runs on plain `python`.
 
-The whole point of the repo being built is keeping agents on track, so the kit practices what
-it preaches:
+## Quickstart
 
-- **A spec the agent can't wander from.** `SPEC.md` + `copilot-instructions.md` pin scope so
-  the agent builds what you asked for, not an over-engineered cousin of it.
-- **A locked, pre-tested core.** The concurrency-critical control plane is already written and
-  verified; the agent builds the shell around it instead of free-styling the hard part (which
-  is where a naive build reintroduces subtle bugs).
-- **Phase-by-phase checkpoints.** The agent stops and reports between phases instead of doing
-  one long run-to-completion where it drifts and you find out too late.
-- **Verify-don't-assert.** The agent must run tests and paste real output before claiming a
-  phase is done.
+Run from the repo root. `coord` is just `python coord/coord.py`; define an alias once (this
+form uses `python3` when present, else `python`, so it works on Linux/macOS/Windows):
 
-## After the build
+```sh
+coord() { command -v python3 >/dev/null 2>&1 && python3 coord/coord.py "$@" || python coord/coord.py "$@"; }
 
-Once merged, `agent-coordination-skills` is itself the thing you use to coordinate real
-parallel Copilot work (e.g. your Power BI formatting research session + your migration-tool
-session). Native hub-and-spoke first; the filesystem control plane for genuine peer sessions.
+# 1. Create the control plane (safe to re-run)
+coord init
+
+# 2. Register two sessions with the paths each is allowed to write
+coord register --session researcher --role research --branch research/fmt --paths "docs/findings/**"
+coord register --session editor     --role migrate  --branch feat/mapper --paths "src/mapper/**"
+
+# 3. Put work on the board, with a dependency
+coord add-task --id research-formatting --desc "research formatting"
+coord add-task --id write-mapper        --desc "build mapper" --deps research-formatting
+
+# 4. Research first; the dependent task unblocks once it's done
+coord claim    --session researcher --task research-formatting
+coord complete --session researcher --task research-formatting --status done
+coord claim    --session editor     --task write-mapper
+
+# 5. See the whole fleet
+coord status
+```
+
+> On PowerShell, define the alias as `function coord { python coord/coord.py @args }` instead.
+
+`.coordination/` is created at the repo root and is already git-ignored. For the full 2-session
+and orchestrator walkthroughs see [`docs/quickstart.md`](docs/quickstart.md); for a worked
+end-to-end scenario see [`examples/research-and-migrate/`](examples/research-and-migrate/README.md).
+
+## How agents use it
+
+- **Skills** ([`skills/`](skills/)) teach the protocol. Every agent loads
+  [`coordination-protocol`](skills/coordination-protocol/SKILL.md) (identity + the checkpoint
+  ritual) plus its role skill — [`orchestrator`](skills/orchestrator/SKILL.md) or
+  [`worker`](skills/worker/SKILL.md).
+- **Custom agents** ([`agents/`](agents/)) are scoped by tools: the
+  [`researcher`](agents/researcher.agent.md) is read-only, the
+  [`editor`](agents/editor.agent.md) is write-scoped, and the
+  [`orchestrator`](agents/orchestrator.agent.md) excludes heavy edits so it delegates.
+- **Hooks** ([`.github/hooks/coordination.json`](.github/hooks/coordination.json)) enforce it
+  at runtime: `sessionStart` auto-registers a session and `preToolUse` denies any write outside
+  the session's owned paths. See [`hooks/README.md`](hooks/README.md).
+
+## Repository layout
+
+```
+coord/          # the coord CLI + JSON Schemas for its records
+skills/         # protocol + role skills every agent loads
+agents/         # scoped custom-agent definitions (orchestrator, researcher, editor)
+hooks/          # write-scope guard + session-register scripts
+.github/hooks/  # hook wiring (coordination.json)
+docs/           # architecture, full protocol reference, quickstart
+examples/       # a worked research-and-migrate scenario
+tests/          # pytest suite (control plane + hook)
+```
+
+## Testing
+
+```sh
+python -m pytest -q
+```
+
+The suite exercises the control plane (dependency blocking, atomic claim, lease deny→steal→reap,
+staleness filtering, stop-flag halt) and the write-scope hook (in-scope allow, out-of-scope and
+traversal deny), plus JSON-Schema validation of the record formats.
+
+## License
+
+[MIT](LICENSE).
