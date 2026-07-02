@@ -1,0 +1,55 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "urn:agent-coordination-skills:registry",
+  "title": "Coord session registry entry",
+  "description": "A registry/<session>.json record. Written by `coord register`; the heartbeat/heartbeat_iso fields are refreshed by `coord heartbeat` and `coord checkpoint`.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "session",
+    "role",
+    "branch",
+    "worktree",
+    "owned_paths",
+    "registered",
+    "heartbeat",
+    "heartbeat_iso"
+  ],
+  "properties": {
+    "session": {
+      "type": "string",
+      "description": "Unique session id."
+    },
+    "role": {
+      "type": "string",
+      "description": "Session role, e.g. orchestrator, researcher, editor."
+    },
+    "branch": {
+      "type": "string",
+      "description": "Git branch this session works on."
+    },
+    "worktree": {
+      "type": "string",
+      "description": "Absolute path to the session's worktree; used to resolve the acting session in the write-scope hook."
+    },
+    "owned_paths": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      },
+      "description": "Comma-separated globs (from --paths) this session is allowed to write."
+    },
+    "registered": {
+      "type": "string",
+      "description": "ISO-8601 UTC timestamp of registration."
+    },
+    "heartbeat": {
+      "type": "number",
+      "description": "Epoch seconds of the last heartbeat; compared against HEARTBEAT_STALE_SEC to decide liveness."
+    },
+    "heartbeat_iso": {
+      "type": "string",
+      "description": "ISO-8601 UTC timestamp of the last heartbeat."
+    }
+  }
+}

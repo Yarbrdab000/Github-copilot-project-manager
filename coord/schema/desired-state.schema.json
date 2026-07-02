@@ -1,0 +1,28 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "urn:agent-coordination-skills:desired-state",
+  "title": "Coord desired state",
+  "description": "state/desired.json — the versioned declarative target that sessions reconcile toward at checkpoints. Created by `coord init` and bumped by `coord state set`.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "version",
+    "desired"
+  ],
+  "properties": {
+    "version": {
+      "type": "integer",
+      "minimum": 0,
+      "description": "Monotonic version, incremented on every `state set`. Messages tagged with an older as_of are stale."
+    },
+    "updated": {
+      "type": "string",
+      "description": "ISO-8601 UTC timestamp of the last update."
+    },
+    "desired": {
+      "type": "object",
+      "additionalProperties": true,
+      "description": "Arbitrary key -> desired value map. Values are whatever `state set --value` parsed as (JSON when parseable, else the raw string)."
+    }
+  }
+}
