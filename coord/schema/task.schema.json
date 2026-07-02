@@ -1,0 +1,52 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "urn:agent-coordination-skills:task-event",
+  "title": "Coord task-ledger event",
+  "description": "One append-only line in board/tasks.jsonl. Task state is event-sourced: the current state of a task id is the fold of all of its events (see _fold_tasks). `desc`/`deps` appear on the add-task event; claim/complete/reap events carry the new status and owner.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "ts",
+    "id",
+    "status",
+    "claimed_by"
+  ],
+  "properties": {
+    "ts": {
+      "type": "number",
+      "description": "Epoch seconds when this event was appended."
+    },
+    "id": {
+      "type": "string",
+      "description": "Task id this event applies to."
+    },
+    "desc": {
+      "type": "string",
+      "description": "Human-readable description (present on the add-task event)."
+    },
+    "deps": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      },
+      "description": "Task ids that must be 'done' before this task can be claimed (present on the add-task event)."
+    },
+    "status": {
+      "type": "string",
+      "enum": [
+        "open",
+        "claimed",
+        "done",
+        "failed"
+      ],
+      "description": "Task status after applying this event."
+    },
+    "claimed_by": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "description": "Session that owns the task after this event, or null when open/unclaimed."
+    }
+  }
+}

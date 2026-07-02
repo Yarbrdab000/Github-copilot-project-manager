@@ -38,6 +38,7 @@ def coord(tmp_path):
             env=env,
         )
 
+    run.root = root.resolve()  # coord.py resolves COORD_ROOT; read artifacts from the same place
     init = run("init")
     assert init.returncode == 0, init.stderr
     return run
@@ -182,3 +183,143 @@ def test_session_stop_flag_halts_only_that_session(coord):
     running = coord("checkpoint", "--session", "researcher")
     assert running.returncode == 0
     assert json.loads(running.stdout)["stop"] == []
+
+
+# --- Schema validation (SPEC §5 coord/schema/*.json) -----------------------
+# The repo is stdlib-only (pytest is the sole dev dep), so instead of the
+# third-party `jsonschema` package we use a tiny validator covering exactly the
+# keywords our schemas use. Its job is to catch drift between a schema and what
+# the CLI actually writes; the negative test below proves it discriminates.
+SCHEMA_DIR = COORD_PY.parent / "schema"
+
+
+def _type_ok(value, t):
+    if t == "object":
+        return isinstance(value, dict)
+    if t == "array":
+        return isinstance(value, list)
+    if t == "string":
+        return isinstance(value, str)
+    if t == "integer":
+        return isinstance(value, int) and not isinstance(value, bool)
+    if t == "number":
+        return isinstance(value, (int, float)) and not isinstance(value, bool)
+    if t == "boolean":
+        return isinstance(value, bool)
+    if t == "null":
+        return value is None
+    raise AssertionError(f"schema uses unsupported type {t!r}")
+
+
+def _schema_errors(instance, schema, path="$"):
+    errors = []
+    if "enum" in schema and instance not in schema["enum"]:
+        errors.append(f"{path}: {instance!r} not in enum {schema['enum']}")
+    if "type" in schema:
+        types = schema["type"] if isinstance(schema["type"], list) else [schema["type"]]
+        if not any(_type_ok(instance, t) for t in types):
+            return errors + [f"{path}: {type(instance).__name__} is not one of {types}"]
+    if "minimum" in schema and _type_ok(instance, "number"):
+        if instance < schema["minimum"]:
+            errors.append(f"{path}: {instance} < minimum {schema['minimum']}")
+    if isinstance(instance, dict):
+        for req in schema.get("required", []):
+            if req not in instance:
+                errors.append(f"{path}: missing required '{req}'")
+        props = schema.get("properties", {})
+        if schema.get("additionalProperties", True) is False:
+            for key in instance:
+                if key not in props:
+                    errors.append(f"{path}: unexpected property '{key}'")
+        for key, subschema in props.items():
+            if key in instance:
+                errors.extend(_schema_errors(instance[key], subschema, f"{path}.{key}"))
+    if isinstance(instance, list) and "items" in schema:
+        for i, element in enumerate(instance):
+            errors.extend(_schema_errors(element, schema["items"], f"{path}[{i}]"))
+    return errors
+
+
+def _load_schema(name):
+    return json.loads((SCHEMA_DIR / name).read_text(encoding="utf-8"))
+
+
+def _assert_valid(instance, schema_name):
+    errs = _schema_errors(instance, _load_schema(schema_name))
+    assert not errs, f"{schema_name} validation failed:\n  " + "\n  ".join(errs)
+
+
+ALL_SCHEMAS = [
+    "registry.schema.json",
+    "task.schema.json",
+    "message.schema.json",
+    "desired-state.schema.json",
+]
+
+
+def test_schema_files_are_valid_json_schema_documents():
+    for name in ALL_SCHEMAS:
+        schema = _load_schema(name)  # parses => valid JSON
+        assert schema["$schema"] == "https://json-schema.org/draft/2020-12/schema"
+        assert "$id" in schema
+        assert schema["type"] == "object"
+        assert isinstance(schema["properties"], dict) and schema["properties"]
+        for req in schema.get("required", []):
+            assert req in schema["properties"], f"{name}: required '{req}' not in properties"
+
+
+def test_registry_sample_matches_schema(coord):
+    _register(coord, "editor", role="editor", branch="feat/editor")
+    coord("heartbeat", "--session", "editor")  # refreshes heartbeat fields
+    reg = json.loads((coord.root / "registry" / "editor.json").read_text(encoding="utf-8"))
+    _assert_valid(reg, "registry.schema.json")
+
+
+def test_task_event_samples_match_schema(coord):
+    coord("add-task", "--id", "research-formatting", "--desc", "figure out palette", "--deps", "")
+    coord("claim", "--session", "researcher", "--task", "research-formatting")
+    coord("complete", "--session", "researcher", "--task", "research-formatting")
+    lines = (coord.root / "board" / "tasks.jsonl").read_text(encoding="utf-8").splitlines()
+    events = [json.loads(l) for l in lines if l.strip()]
+    assert len(events) >= 3  # add-task, claim, complete
+    for ev in events:
+        _assert_valid(ev, "task.schema.json")
+
+
+def test_message_sample_matches_schema(coord):
+    coord("send", "--from", "orch", "--to", "editor", "--body", "use palette v3", "--as-of", "2", "--ttl", "600")
+    coord("send", "--from", "orch", "--to", "editor", "--body", "no ttl, no version")  # as_of/expires null
+    lines = (coord.root / "inbox" / "editor.jsonl").read_text(encoding="utf-8").splitlines()
+    for l in lines:
+        if l.strip():
+            _assert_valid(json.loads(l), "message.schema.json")
+
+
+def test_desired_state_sample_matches_schema(coord):
+    # after init
+    path = coord.root / "state" / "desired.json"
+    _assert_valid(json.loads(path.read_text(encoding="utf-8")), "desired-state.schema.json")
+    # after a state set (version bump + populated desired map)
+    coord("state", "set", "--session", "orch", "--key", "target_palette", "--value", '"v3"')
+    _assert_valid(json.loads(path.read_text(encoding="utf-8")), "desired-state.schema.json")
+
+
+def test_schema_validator_discriminates():
+    """Guard against a no-op validator: bad instances must produce errors."""
+    good_reg = {
+        "session": "s", "role": "r", "branch": "b", "worktree": "/w", "owned_paths": [],
+        "registered": "2020-01-01T00:00:00Z", "heartbeat": 1.0, "heartbeat_iso": "2020-01-01T00:00:00Z",
+    }
+    reg = _load_schema("registry.schema.json")
+    assert _schema_errors(good_reg, reg) == []
+    assert _schema_errors({k: v for k, v in good_reg.items() if k != "session"}, reg)  # missing required
+    assert _schema_errors({**good_reg, "owned_paths": "not-a-list"}, reg)              # wrong type
+    assert _schema_errors({**good_reg, "surprise": 1}, reg)                            # extra property
+
+    msg = _load_schema("message.schema.json")
+    good_msg = {"seq": 1, "ts": "t", "from": "a", "to": "b", "body": "x", "as_of": None, "expires": None}
+    assert _schema_errors(good_msg, msg) == []
+    assert _schema_errors({**good_msg, "as_of": "1"}, msg)  # string, not integer/null
+
+    task = _load_schema("task.schema.json")
+    assert _schema_errors({"ts": 1.0, "id": "t", "status": "bogus", "claimed_by": None}, task)  # bad enum

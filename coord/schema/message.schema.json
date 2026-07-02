@@ -1,0 +1,53 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "urn:agent-coordination-skills:inbox-message",
+  "title": "Coord inbox message",
+  "description": "One append-only line in inbox/<to>.jsonl, written by `coord send`. A message is stale (skipped by checkpoint/inbox) when its TTL has expired OR its `as_of` is older than the current desired-state version.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "seq",
+    "ts",
+    "from",
+    "to",
+    "body",
+    "as_of",
+    "expires"
+  ],
+  "properties": {
+    "seq": {
+      "type": "integer",
+      "description": "Monotonic sequence (time.time_ns) used as the per-recipient inbox cursor."
+    },
+    "ts": {
+      "type": "string",
+      "description": "ISO-8601 UTC timestamp the message was queued."
+    },
+    "from": {
+      "type": "string",
+      "description": "Sender session id."
+    },
+    "to": {
+      "type": "string",
+      "description": "Recipient session id (names the inbox file)."
+    },
+    "body": {
+      "type": "string",
+      "description": "Message text."
+    },
+    "as_of": {
+      "type": [
+        "integer",
+        "null"
+      ],
+      "description": "The desired-state version this message assumed; if less than the current version the message is stale. Null means version-independent."
+    },
+    "expires": {
+      "type": [
+        "number",
+        "null"
+      ],
+      "description": "Epoch seconds after which the message is stale, or null for no TTL."
+    }
+  }
+}
