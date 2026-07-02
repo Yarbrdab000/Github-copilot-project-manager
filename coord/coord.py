@@ -176,7 +176,11 @@ def _acquire_raw(name: str, holder: str, ttl: int) -> bool:
         meta = _read_json(ld / "meta.json", {})
         expired = (now() - meta.get("acquired", 0)) > meta.get("ttl", 0)
         holder_stale = _heartbeat_stale(meta.get("holder"))
-        if expired and holder_stale:
+        # An empty meta means the dir exists but meta.json isn't written yet (the
+        # mkdir->meta-write window) or is mid-release: that lock is freshly held,
+        # not stealable. Require a real holder before stealing, else two racers
+        # could both "steal" a just-created lock and both win a task claim.
+        if meta.get("holder") and expired and holder_stale:
             # steal: only when lease expired AND holder is provably dead
             _atomic_write(ld / "meta.json",
                           json.dumps({"holder": holder, "acquired": now(), "ttl": ttl, "stolen_from": meta.get("holder")}))
