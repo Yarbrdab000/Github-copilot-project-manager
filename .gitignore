@@ -1,0 +1,12 @@
+# --- Python ---
+__pycache__/
+*.py[cod]
+.pytest_cache/
+
+# --- coord control-plane runtime ---
+# Ignore everything the control plane writes at runtime, but keep the directory.
+.coordination/*
+!.coordination/.gitkeep
+
+# --- atomic-write temp files (temp + os.replace) ---
+*.tmp.*
