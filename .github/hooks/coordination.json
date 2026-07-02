@@ -1,0 +1,21 @@
+{
+  "version": 1,
+  "hooks": {
+    "sessionStart": [
+      {
+        "type": "command",
+        "bash": "bash hooks/scripts/session_register.sh",
+        "powershell": "bash hooks/scripts/session_register.sh",
+        "timeout": 15
+      }
+    ],
+    "preToolUse": [
+      {
+        "type": "command",
+        "bash": "python3 hooks/scripts/write_scope_guard.py",
+        "powershell": "python hooks/scripts/write_scope_guard.py",
+        "timeout": 10
+      }
+    ]
+  }
+}
