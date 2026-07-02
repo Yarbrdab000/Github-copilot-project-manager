@@ -1,0 +1,33 @@
+{
+  "name": "coordination-collection",
+  "metadata": {
+    "description": "Agent coordination skills for code-executing Copilots (GitHub Copilot CLI, Claude Code, Cursor): a file-based control plane for multi-agent task claiming, resource locking, checkpointed state, and messaging.",
+    "version": "0.1.0"
+  },
+  "owner": {
+    "name": "Yarbrdab000",
+    "email": "noreply@github.com"
+  },
+  "plugins": [
+    {
+      "name": "agent-coordination-skills",
+      "source": ".",
+      "description": "File-based control plane for coordinating multiple Copilot CLI agents: atomic task claiming with dependency gating, leased resource locks with heartbeat-based reaping, checkpointed shared state, and staleness-filtered messaging. Ships a coordination-protocol skill, an orchestrator + worker skill pair, three scoped agents (orchestrator/researcher/editor), and a write-scope enforcement hook.",
+      "version": "0.1.0",
+      "skills": [
+        "./skills/coordination-protocol",
+        "./skills/orchestrator",
+        "./skills/worker"
+      ],
+      "agents": [
+        "./agents/orchestrator.agent.md",
+        "./agents/researcher.agent.md",
+        "./agents/editor.agent.md"
+      ],
+      "mcpServers": {},
+      "repository": "https://github.com/Yarbrdab000/Github-copilot-project-manager",
+      "keywords": ["coordination","multi-agent","orchestration","task-queue","locking","copilot","cli","control-plane","agents"],
+      "license": "MIT"
+    }
+  ]
+}
