@@ -119,6 +119,53 @@ $ coord state show
 
 See [`desired-state.schema.json`](../coord/schema/desired-state.schema.json).
 
+### `coord state propose --key KEY --value JSON [--invalidates CSV] [--note TEXT] [--session ID]`
+Write a **pending** proposal to amend `desired[KEY]` — a navigator's only lever on the fleet.
+It records the proposed value (parsed as JSON like `set`, with any `--invalidates` task ids and
+free-text `--note`) under `state/proposals/<pid>.json` and prints the proposal id, but **does
+not bump the live version** — nothing propagates until a human approves.
+
+```
+$ coord state propose --session nav --key target_palette --value '"v3"' --invalidates write-mapper --note "v3 changes the mapper contract"
+proposed 1783358576540003700: desired.target_palette: "v2" -> "v3" (pending; version unchanged at 1)
+  invalidates: ['write-mapper']
+```
+
+### `coord state proposals`
+List every **pending** proposal with its `current -> proposed` diff, origin, and any
+`invalidates`/`note`. Applied and rejected proposals are omitted.
+
+```
+$ coord state proposals
+  1783358576540003700  from=nav  target_palette: "v2" -> "v3"  invalidates=write-mapper  note=v3 changes the mapper contract
+```
+
+### `coord state approve --id PID [--session ID]`
+Apply a pending proposal — the human-gated act that actually moves the fleet. Under the same
+`__state__` lock `state set` uses, it applies the value, **bumps the version**, marks the
+proposal `applied`, and for each `--invalidates` task folds it back to `open` and drops a fresh
+message (`as_of` = the new version) into its current claimant's inbox. Fails (exit 1) if the
+proposal doesn't exist or isn't `pending`.
+
+```
+$ coord state approve --session orch --id 1783358576540003700
+approved 1783358576540003700: desired.target_palette applied; state version -> 2
+  requeued: [{'task': 'write-mapper', 'notified': 'w1'}]
+```
+
+The `navigator` role **cannot** run this — the write-scope hook denies `coord state approve`
+for a navigator session, so a proposal is only ever approved by a human/orchestrator.
+
+### `coord state reject --id PID [--reason TEXT] [--session ID]`
+Mark a pending proposal `rejected`, recording an optional `--reason`. **Leaves the version
+unchanged** — nothing propagates. Fails (exit 1) if the proposal doesn't exist or isn't
+`pending`.
+
+```
+$ coord state reject --session orch --id 1783358611618012800 --reason "staying on v3"
+rejected 1783358611618012800 (version unchanged)
+```
+
 ### `coord add-task --id ID [--desc TEXT] [--deps CSV]`
 Append a new open task to the board. `--deps` is a comma-separated list of task ids that must
 be `done` before this task can be claimed.
@@ -150,12 +197,27 @@ $ coord claim --session editor --task write-mapper
 coord: task 'write-mapper' blocked on unmet deps: ['research-formatting']    # exit 1
 ```
 
+On a successful claim it also records the current desired-state version as the task's
+`claimed_at_version`, so the fleet can tell whether a task was claimed against a now-superseded
+plan (see `state approve --invalidates`, which requeues such tasks).
+
 ### `coord complete --session ID --task ID [--status done|failed|open]`
 Record a task outcome (default `done`). `--status open` re-opens a task for someone else.
 
 ```
 $ coord complete --session researcher --task research-formatting --status done
 task research-formatting -> done
+```
+
+A **stale-completion guard** protects against completing work the plan has moved past:
+`complete` refuses (exit 1) unless the task is still `claimed` by the *calling* session. If the
+task was requeued out from under the worker — e.g. by an approved proposal that
+`--invalidates`d it — its folded status is no longer `claimed` by that session, so a worker
+that kept going cannot mark stale work done; it must re-claim first.
+
+```
+$ coord complete --session w1 --task write-mapper --status done
+coord: cannot complete 'write-mapper': it is 'open' (claimed_by=w1), not claimed by 'w1' — it may have been requeued/invalidated; re-claim before completing   # exit 1
 ```
 
 ### `coord lock acquire --session ID --resource NAME [--ttl SEC]` / `coord lock release ...`

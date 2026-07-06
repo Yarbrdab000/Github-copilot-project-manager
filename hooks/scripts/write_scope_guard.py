@@ -14,6 +14,12 @@ with the ``COORD_SESSION`` env var), then:
     branch, and redirects to absolute paths outside the worktree. Otherwise allow.
   * read tools (grep/glob/view/...): always **allow**.
 
+A ``navigator``-role session is special (NAVIGATOR_SPEC §4): all file-editing
+tools are denied outright, and ``bash`` is restricted to an allow-list — ``coord
+state propose/proposals/show``, ``coord status``, ``coord tasks``, and read-only
+inspection (``git status|log|diff|show``, ``cat``, ``ls``, ``grep``, ``find``) —
+with everything else (incl. any output redirection) denied.
+
 Emits ``{"permissionDecision":"allow"}`` or
 ``{"permissionDecision":"deny","permissionDecisionReason":"..."}`` on stdout and exits 0.
 
@@ -168,6 +174,68 @@ def _check_bash(command: str, session_branch: str, worktree: str):
     return "allow", None
 
 
+# --- navigator enforcement (NAVIGATOR_SPEC §4) -------------------------------
+# "Conversation without authority" is a HARD property: a navigator-role session
+# may only propose desired-state changes and read. Its bash is an ALLOW-LIST
+# (deny by default); all file-editing tools are denied outright.
+NAV_COORD_STATE_ALLOWED = {"propose", "proposals", "show"}
+NAV_COORD_TOP_ALLOWED = {"status", "tasks"}
+NAV_READONLY_CMDS = {"cat", "ls", "grep", "find"}
+NAV_GIT_READONLY = {"status", "log", "diff", "show"}
+# shell separators that chain multiple commands; split so ANY denied segment denies
+_SEG_SEP = re.compile(r"&&|\|\||;|\|")
+
+
+def _strip_quoted(s: str) -> str:
+    """Remove quoted spans so a quoted '>' in a proposal value isn't read as a redirect."""
+    s = re.sub(r'"[^"]*"', "", s)
+    s = re.sub(r"'[^']*'", "", s)
+    return s
+
+
+def _normalize_coord(seg: str) -> str:
+    """Collapse a spelled-out `python|py|python3 <path>coord.py` invocation to the
+    `coord` alias, so the allow-list can't be bypassed by not using the alias."""
+    return re.sub(r"^\s*(?:python3?|py)\s+\S*coord\.py\b", "coord", seg.strip())
+
+
+def _nav_segment_allowed(seg: str) -> bool:
+    seg = seg.strip()
+    if not seg:
+        return True  # inert (e.g. an empty split around a trailing separator)
+    if ">" in _strip_quoted(seg):
+        return False  # any output redirection to a file is denied, regardless of target
+    seg = _normalize_coord(seg)
+    tokens = seg.split()
+    if not tokens:
+        return True
+    head = tokens[0]
+    if head == "coord":
+        if len(tokens) >= 2 and tokens[1] in NAV_COORD_TOP_ALLOWED:
+            return True
+        if len(tokens) >= 3 and tokens[1] == "state" and tokens[2] in NAV_COORD_STATE_ALLOWED:
+            return True
+        return False  # coord state set/approve/reject, claim, complete, add-task, lock, send, stop, ...
+    if head == "git":
+        return len(tokens) >= 2 and tokens[1] in NAV_GIT_READONLY  # push/merge/checkout/switch/commit denied
+    if head in NAV_READONLY_CMDS:
+        return True
+    return False
+
+
+def _check_navigator_bash(command: str):
+    if not command or not command.strip():
+        return "allow", None
+    for seg in _SEG_SEP.split(command):
+        if not _nav_segment_allowed(seg):
+            return "deny", (
+                "navigator role may only run 'coord state propose/proposals/show', "
+                "'coord status', 'coord tasks', and read-only inspection "
+                "(git status|log|diff|show, cat, ls, grep, find) — denied: " + seg.strip()
+            )
+    return "allow", None
+
+
 def main() -> None:
     raw = sys.stdin.read()
     try:
@@ -206,6 +274,17 @@ def main() -> None:
     worktree = session.get("worktree") or cwd
     owned = session.get("owned_paths") or []
     branch = session.get("branch") or ""
+    role = session.get("role") or ""
+
+    # Navigator: conversation without authority. Read tools were already allowed
+    # above; here we deny ALL file edits and constrain bash to a propose/read
+    # allow-list. This runs BEFORE the normal worker logic and always _emit()s,
+    # so navigator sessions never reach the per-worker write-scoping path.
+    if role == "navigator":
+        if tool in WRITE_TOOLS:
+            _emit("deny", "navigator role may not edit files; its only lever is 'coord state propose'")
+        command = args.get("command") or args.get("cmd") or ""
+        _emit(*_check_navigator_bash(str(command)))
 
     if tool == "bash":
         command = args.get("command") or args.get("cmd") or ""

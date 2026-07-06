@@ -84,6 +84,7 @@ def _die(msg: str, code: int = 1):
 def cmd_init(a):
     for d in ("registry", "inbox", "cursor", "locks", "state", "log", "control", "board"):
         _p(d).mkdir(parents=True, exist_ok=True)
+    _p("state", "proposals").mkdir(parents=True, exist_ok=True)
     state = _p("state", "desired.json")
     if not state.exists():
         _atomic_write(state, json.dumps({"version": 0, "updated": iso(), "desired": {}}, indent=2))
@@ -233,6 +234,154 @@ def cmd_state(a):
             print(f"desired.{a.key} set; state version -> {st['version']}")
         finally:
             _release_raw("__state__", a.session or "state")
+        return
+    if a.action == "propose":
+        _state_propose(a)
+        return
+    if a.action == "proposals":
+        _state_proposals(a)
+        return
+    if a.action == "approve":
+        _state_approve(a)
+        return
+    if a.action == "reject":
+        _state_reject(a)
+        return
+
+
+# ---- navigator proposals (human-gated desired-state amendments) -----------
+def _proposal_path(pid: str) -> Path:
+    return _p("state", "proposals", f"{pid}.json")
+
+
+def _state_propose(a):
+    """Write a PENDING proposal to amend desired[key]. Does NOT bump the live version."""
+    if not a.key or a.value is None:
+        _die("`state propose` requires --key and --value")
+    st = _read_json(_p("state", "desired.json"), {"version": 0, "desired": {}})
+    try:
+        val = json.loads(a.value)
+    except (json.JSONDecodeError, TypeError):
+        val = a.value
+    pid = str(time.time_ns())
+    current = st.get("desired", {}).get(a.key)
+    proposal = {
+        "pid": pid,
+        "from": a.session or "unknown",
+        "key": a.key,
+        "value": val,
+        "invalidates": [t for t in (a.invalidates or "").split(",") if t],
+        "note": a.note or "",
+        "status": "pending",
+        "created": iso(),
+        "base_version": st.get("version", 0),
+    }
+    _atomic_write(_proposal_path(pid), json.dumps(proposal, indent=2))
+    print(f"proposed {pid}: desired.{a.key}: {json.dumps(current)} -> {json.dumps(val)} "
+          f"(pending; version unchanged at {st.get('version', 0)})")
+    if proposal["invalidates"]:
+        print(f"  invalidates: {proposal['invalidates']}")
+
+
+def _state_proposals(a):
+    """List pending proposals with their current->proposed diff."""
+    st = _read_json(_p("state", "desired.json"), {"version": 0, "desired": {}})
+    desired = st.get("desired", {})
+    pending = []
+    for pf in sorted(_p("state", "proposals").glob("*.json")):
+        prop = _read_json(pf, {})
+        if prop.get("status") == "pending":
+            pending.append(prop)
+    if not pending:
+        print("(no pending proposals)")
+        return
+    for prop in pending:
+        cur = desired.get(prop["key"])
+        inv = ("  invalidates=" + ",".join(prop.get("invalidates", []))) if prop.get("invalidates") else ""
+        note = ("  note=" + prop["note"]) if prop.get("note") else ""
+        print(f"  {prop['pid']}  from={prop.get('from')}  {prop['key']}: "
+              f"{json.dumps(cur)} -> {json.dumps(prop['value'])}{inv}{note}")
+
+
+def _state_approve(a):
+    """Apply a pending proposal: bump the version, requeue invalidated tasks, and
+    notify their claimants as of the NEW version. Human-gated (the navigator cannot
+    run this — see the write-scope guard)."""
+    if not a.id:
+        _die("`state approve` requires --id")
+    ppath = _proposal_path(a.id)
+    prop = _read_json(ppath)
+    if prop is None:
+        _die(f"no such proposal '{a.id}'")
+    if prop.get("status") != "pending":
+        _die(f"proposal '{a.id}' is '{prop.get('status')}' — not pending")
+    path = _p("state", "desired.json")
+    # serialize desired-state writes behind the internal lock (same pattern as `state set`)
+    for _ in range(50):
+        if _acquire_raw("__state__", a.session or "state", 30):
+            break
+        time.sleep(0.1)
+    else:
+        _die("could not acquire state lock")
+    try:
+        st = _read_json(path, {"version": 0, "desired": {}})
+        st.setdefault("desired", {})[prop["key"]] = prop["value"]
+        st["version"] = st.get("version", 0) + 1
+        st["updated"] = iso()
+        new_version = st["version"]
+        _atomic_write(path, json.dumps(st, indent=2))
+        _append(_p("board", "events.jsonl"),
+                {"ts": now(), "event": "state_approved", "pid": a.id, "key": prop["key"], "version": new_version})
+        # requeue each invalidated task and message its current claimant as-of the NEW
+        # version, so the note lands FRESH (not stale) at the claimant's next checkpoint.
+        requeued = []
+        tasks = _fold_tasks()
+        for tid in prop.get("invalidates", []):
+            t = tasks.get(tid)
+            if not t:
+                continue
+            claimant = t.get("claimed_by")
+            _append(_p("board", "tasks.jsonl"),
+                    {"ts": now(), "id": tid, "status": "open", "claimed_by": None})
+            if claimant:
+                msg = {
+                    "seq": time.time_ns(),
+                    "ts": iso(),
+                    "from": a.session or "orchestrator",
+                    "to": claimant,
+                    "body": f"task '{tid}' invalidated by approved proposal {a.id} "
+                            f"(desired.{prop['key']} -> v{new_version}); stop and re-claim",
+                    "as_of": new_version,
+                    "expires": None,
+                }
+                _append(_p("inbox", f"{claimant}.jsonl"), msg)
+            requeued.append({"task": tid, "notified": claimant})
+        prop["status"] = "applied"
+        _atomic_write(ppath, json.dumps(prop, indent=2))
+        print(f"approved {a.id}: desired.{prop['key']} applied; state version -> {new_version}")
+        if requeued:
+            print(f"  requeued: {requeued}")
+    finally:
+        _release_raw("__state__", a.session or "state")
+
+
+def _state_reject(a):
+    """Mark a pending proposal rejected. No version change."""
+    if not a.id:
+        _die("`state reject` requires --id")
+    ppath = _proposal_path(a.id)
+    prop = _read_json(ppath)
+    if prop is None:
+        _die(f"no such proposal '{a.id}'")
+    if prop.get("status") != "pending":
+        _die(f"proposal '{a.id}' is '{prop.get('status')}' — not pending")
+    prop["status"] = "rejected"
+    if a.reason:
+        prop["reason"] = a.reason
+    _atomic_write(ppath, json.dumps(prop, indent=2))
+    _append(_p("board", "events.jsonl"),
+            {"ts": now(), "event": "state_rejected", "pid": a.id, "key": prop.get("key")})
+    print(f"rejected {a.id} (version unchanged)")
 
 
 # ---- tasks (append-only board + atomic claim) -----------------------------
@@ -244,7 +393,7 @@ def _fold_tasks():
         if not tid:
             continue
         t = tasks.setdefault(tid, {"id": tid, "status": "open", "deps": [], "claimed_by": None})
-        for k in ("desc", "deps", "status", "claimed_by"):
+        for k in ("desc", "deps", "status", "claimed_by", "claimed_at_version"):
             if k in ev and ev[k] is not None:
                 t[k] = ev[k]
     return tasks
@@ -285,8 +434,10 @@ def cmd_claim(a):
         tasks = _fold_tasks()  # re-read under lock
         if tasks[a.task]["status"] != "open":
             _die(f"task '{a.task}' was just claimed by {tasks[a.task]['claimed_by']}")
+        cur_version = _read_json(_p("state", "desired.json"), {"version": 0}).get("version", 0)
         _append(_p("board", "tasks.jsonl"),
-                {"ts": now(), "id": a.task, "status": "claimed", "claimed_by": a.session})
+                {"ts": now(), "id": a.task, "status": "claimed", "claimed_by": a.session,
+                 "claimed_at_version": cur_version})
     finally:
         _release_raw(f"task-{a.task}", a.session)
     print(f"{a.session} claimed {a.task}")
@@ -296,6 +447,15 @@ def cmd_complete(a):
     tasks = _fold_tasks()
     if a.task not in tasks:
         _die(f"no such task '{a.task}'")
+    t = tasks[a.task]
+    # Stale-completion guard: refuse to complete a task this session doesn't
+    # currently hold. If it was requeued/invalidated out from under the worker,
+    # its folded status is no longer 'claimed' by this session — so a worker that
+    # kept going on an invalidated task cannot mark it done stale.
+    if t.get("status") != "claimed" or t.get("claimed_by") != a.session:
+        _die(f"cannot complete '{a.task}': it is '{t.get('status')}' "
+             f"(claimed_by={t.get('claimed_by')}), not claimed by '{a.session}' — "
+             f"it may have been requeued/invalidated; re-claim before completing")
     _append(_p("board", "tasks.jsonl"), {"ts": now(), "id": a.task, "status": a.status, "claimed_by": a.session})
     print(f"task {a.task} -> {a.status}")
 
@@ -430,8 +590,13 @@ def build_parser():
     c = sub.add_parser("checkpoint"); c.set_defaults(func=cmd_checkpoint); c.add_argument("--session", required=True)
 
     st = sub.add_parser("state"); st.set_defaults(func=cmd_state)
-    st.add_argument("action", choices=["show", "set"]); st.add_argument("--key"); st.add_argument("--value")
+    st.add_argument("action", choices=["show", "set", "propose", "proposals", "approve", "reject"])
+    st.add_argument("--key"); st.add_argument("--value")
     st.add_argument("--session")
+    st.add_argument("--invalidates", help="comma-separated task ids to requeue when a proposal is approved")
+    st.add_argument("--note", help="free-text note attached to a proposal")
+    st.add_argument("--id", help="proposal id (pid) for approve/reject")
+    st.add_argument("--reason", help="reason recorded when rejecting a proposal")
 
     at = sub.add_parser("add-task"); at.set_defaults(func=cmd_add_task)
     at.add_argument("--id", required=True); at.add_argument("--desc", default=""); at.add_argument("--deps", default="")

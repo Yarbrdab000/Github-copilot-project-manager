@@ -164,6 +164,113 @@ coord resume                     # clear it to continue
 
 ---
 
+## Walkthrough C — navigator proposes, human approves
+
+A **navigator** is the fleet's design partner: it deliberates with the human but has no
+authority to act. Its only lever is a *proposal* to change `desired.json`, which a human
+approves. This runs the full **propose → approve → propagate** loop, including how an approved
+change with `--invalidates` requeues in-flight work instead of stomping it.
+
+Use a scratch `COORD_ROOT` so this stays out of any real plane:
+
+```sh
+export COORD_ROOT="$(mktemp -d)"    # PowerShell: $env:COORD_ROOT = Join-Path $env:TEMP ([guid]::NewGuid())
+```
+
+### 1. Init the plane; register a worker and a navigator
+
+```sh
+coord init
+coord register --session w1  --role editor    --branch feat/mapper --paths "src/**"
+coord register --session nav --role navigator --branch main         --paths ""
+coord state set --session orch --key target_palette --value '"v2"'   # -> state version -> 1
+```
+
+### 2. Put work on the board and have the worker claim it
+
+```sh
+coord add-task --id write-mapper --desc "build the field mapper"
+coord claim --session w1 --task write-mapper    # -> w1 claimed write-mapper
+```
+
+### 3. The navigator proposes a change — it does NOT take effect yet
+
+```sh
+coord state propose --session nav --key target_palette --value '"v3"' \
+    --invalidates write-mapper --note "v3 changes the mapper contract"
+# -> proposed 1783358576540003700: desired.target_palette: "v2" -> "v3" (pending; version unchanged at 1)
+# ->   invalidates: ['write-mapper']
+
+coord state show
+# -> "version": 1 — propose writes a pending record; it does NOT move the fleet
+
+coord state proposals
+# -> 1783358576540003700  from=nav  target_palette: "v2" -> "v3"  invalidates=write-mapper  note=v3 changes the mapper contract
+```
+
+### 4. A human approves — now it propagates
+
+The navigator **cannot** approve its own proposal (the write-scope hook denies it); a human or
+the orchestrator runs `approve`:
+
+```sh
+coord state approve --session orch --id 1783358576540003700
+# -> approved 1783358576540003700: desired.target_palette applied; state version -> 2
+# ->   requeued: [{'task': 'write-mapper', 'notified': 'w1'}]
+```
+
+Three things happened together — the version bumped, the task requeued, and the claimant was
+notified:
+
+```sh
+coord state show
+# -> "version": 2, desired.target_palette now "v3"
+
+coord tasks
+# -> [      open] write-mapper   <- folded back to OPEN, re-claimable
+
+coord checkpoint --session w1
+# -> "desired_version": 2, plus a FRESH message (as_of=2) in w1's inbox:
+#    "task 'write-mapper' invalidated by approved proposal 1783358576540003700 ...; stop and re-claim"
+```
+
+### 5. Stale work can't be completed
+
+If `w1` ignored the notice and tried to finish the old task, the **stale-completion guard**
+refuses it — the task is no longer claimed by `w1`:
+
+```sh
+coord complete --session w1 --task write-mapper --status done
+# -> coord: cannot complete 'write-mapper': it is 'open' (claimed_by=w1), not claimed by 'w1'
+#    — it may have been requeued/invalidated; re-claim before completing        # exit 1
+```
+
+`w1` must re-`claim write-mapper` before it can work or complete it — the approved re-plan, not
+stale momentum, wins.
+
+### 6. Rejection changes nothing
+
+A proposal the human doesn't want is rejected, and the desired state is untouched:
+
+```sh
+coord state propose --session nav --key target_palette --value '"v4"' --note "alternative direction"
+# -> proposed 1783358611618012800: desired.target_palette: "v3" -> "v4" (pending; version unchanged at 2)
+
+coord state reject --session orch --id 1783358611618012800 --reason "staying on v3"
+# -> rejected 1783358611618012800 (version unchanged)
+
+coord state show
+# -> still "version": 2, desired.target_palette "v3"
+```
+
+The navigator influences the fleet **only** by proposing a change a human approves — it never
+dispatches, merges, edits, or self-approves. See
+[`agents/navigator.agent.md`](../agents/navigator.agent.md) and
+[`skills/navigator/SKILL.md`](../skills/navigator/SKILL.md) for the role, and
+[`architecture.md`](./architecture.md) §7 for the design.
+
+---
+
 ## Where to go next
 
 - A concrete, worked end-to-end scenario:

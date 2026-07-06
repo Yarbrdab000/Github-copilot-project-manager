@@ -47,6 +47,11 @@
         "null"
       ],
       "description": "Session that owns the task after this event, or null when open/unclaimed."
+    },
+    "claimed_at_version": {
+      "type": "integer",
+      "minimum": 0,
+      "description": "desired-state version at the moment of claim (present on the claim event); enables detecting silently-stale work."
     }
   }
 }

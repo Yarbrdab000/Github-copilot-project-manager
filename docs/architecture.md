@@ -2,7 +2,9 @@
 
 This document expands the design in [`SPEC.md`](../SPEC.md) §2–3. It explains the two
 coordination modes, when to use each, the design principles the control plane enforces, and
-how each classic multi-agent failure mode is mechanically prevented.
+how each classic multi-agent failure mode is mechanically prevented — and how a third
+**navigator** role completes the role symmetry through human-approved desired-state proposals
+(§7).
 
 ## 1. The problem
 
@@ -149,3 +151,77 @@ formats.
 - **A stale message is dropped, not delivered.** `checkpoint` and `inbox` skip messages whose
   TTL has expired or whose `as_of` is older than the current desired-state version, and report
   only a count of what was skipped.
+
+## 7. Three roles, one seam: `desired.json`
+
+§2 described two coordination *modes*. Those modes are populated by **roles**, and the control
+plane is designed around a symmetry of three:
+
+| Role | Has | Lacks | Its lever on the fleet |
+|---|---|---|---|
+| **Orchestrator** | authority | conversation | dispatches, reaps, integrates — and must keep ticking |
+| **Navigator** | conversation | authority | can only *propose* a `desired.json` change a human approves |
+| **Worker** | execution within owned paths | both of the above | claims a task, works its slice, reconciles at checkpoints |
+
+The orchestrator is **authority without conversation**: it holds the plan, dispatches work,
+reaps dead sessions, and integrates finished branches — but it cannot afford to sit and
+deliberate, because if it stalls the fleet stalls. The navigator is the mirror image,
+**conversation without authority**: it deliberates with the human about *what the fleet should
+be doing*, but it cannot dispatch, claim, complete, merge, edit, or approve anything. The
+worker executes, but only within its owned paths.
+
+The **seam** between the orchestrator and the navigator is the one artifact workers already
+reconcile against: the versioned `desired.json`. The navigator never touches the fleet
+directly — it can only write a *proposal* to amend `desired.json`, which a human approves. On
+approval the change is applied, the version bumps, and workers pick it up at their next
+checkpoint along the exact propagation path §3 principle #1 already defines. This is why adding
+a navigator required **no new channel**: it plugs into the declarative-state seam that was
+there all along.
+
+### propose → approve → propagate
+
+```mermaid
+flowchart LR
+    NAV[Navigator<br/>conversation, no authority] -->|coord state propose<br/>--invalidates T| P[state/proposals/&lt;pid&gt;.json<br/>pending — version UNCHANGED]
+    P -->|human reviews| H{approve?}
+    H -->|coord state approve| A[desired.json applied<br/>version bumps]
+    H -->|coord state reject| R[proposal rejected<br/>version unchanged]
+    A -->|task T folded → open| B[board/tasks.jsonl]
+    A -->|fresh as_of=newver msg| I[inbox/&lt;claimant&gt;.jsonl]
+    B --> W[Worker reconciles<br/>at next checkpoint]
+    I --> W
+```
+
+Three properties make this a genuine lever, not a back door:
+
+1. **Propose does not act.** `coord state propose` only writes a pending record under
+   `state/proposals/`; it does **not** bump the live version, so nothing propagates until a
+   human approves. The navigator's shell is additionally constrained by the write-scope hook to
+   a propose/read allow-list (see [`protocol.md`](./protocol.md) and
+   [`hooks/README.md`](../hooks/README.md)), so it cannot approve its own proposal.
+2. **Approval is the only thing that moves the world.** `coord state approve` applies the
+   value, bumps the version, and marks the proposal `applied` — the same monotonic-version
+   write `state set` uses. A human (or the orchestrator on a human's behalf) runs it; the
+   navigator role is denied it by the hook.
+3. **Invalidation is a re-plan, not a stomp** — see below.
+
+### Invalidation is a re-plan event, not a stomp
+
+When an approved design change makes in-flight work obsolete, approving with
+`--invalidates T` turns the change into a **controlled re-plan** rather than a silent overwrite
+of a worker mid-task:
+
+- Task `T` is **folded back to `open`** on the board (an append to the ledger, not a rewrite),
+  so it is re-claimable — by the same worker starting clean, or by another.
+- A **fresh message** (`as_of` = the *new* version) is dropped into the prior claimant's inbox
+  telling it to stop and re-claim. Because `as_of` is the new version, the note lands **fresh**
+  at the claimant's next checkpoint instead of being filtered out as stale.
+- If the prior claimant kept working and tries to `coord complete T`, the **stale-completion
+  guard** refuses it (non-zero exit): the task is no longer `claimed` by that session, so stale
+  work cannot be marked done. The worker must re-claim `T` first.
+
+The invariant this preserves: **the navigator can influence the fleet only by proposing a
+`desired.json` change a human approves.** It never dispatches, merges, edits, or self-approves.
+Every path by which its intent reaches a worker runs through the human-gated version bump and
+the checkpoint the worker already performs. See [`quickstart.md`](./quickstart.md) Walkthrough
+C for a runnable end-to-end trace.
