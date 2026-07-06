@@ -392,17 +392,23 @@ def _fold_tasks():
         tid = ev.get("id")
         if not tid:
             continue
-        t = tasks.setdefault(tid, {"id": tid, "status": "open", "deps": [], "claimed_by": None})
-        for k in ("desc", "deps", "status", "claimed_by", "claimed_at_version"):
+        t = tasks.setdefault(tid, {"id": tid, "status": "open", "deps": [], "claimed_by": None,
+                                    "attempts": 0, "verified": False})
+        for k in ("desc", "deps", "status", "claimed_by", "claimed_at_version",
+                  "verify", "max_attempts", "attempts", "verified"):
             if k in ev and ev[k] is not None:
                 t[k] = ev[k]
     return tasks
 
 
 def cmd_add_task(a):
-    _append(_p("board", "tasks.jsonl"),
-            {"ts": now(), "id": a.id, "desc": a.desc, "deps": [d for d in (a.deps or "").split(",") if d],
-             "status": "open", "claimed_by": None})
+    ev = {"ts": now(), "id": a.id, "desc": a.desc, "deps": [d for d in (a.deps or "").split(",") if d],
+          "status": "open", "claimed_by": None}
+    if a.verify is not None:
+        ev["verify"] = a.verify
+    if a.max_attempts is not None:
+        ev["max_attempts"] = a.max_attempts
+    _append(_p("board", "tasks.jsonl"), ev)
     print(f"added task {a.id}")
 
 
@@ -458,6 +464,43 @@ def cmd_complete(a):
              f"it may have been requeued/invalidated; re-claim before completing")
     _append(_p("board", "tasks.jsonl"), {"ts": now(), "id": a.task, "status": a.status, "claimed_by": a.session})
     print(f"task {a.task} -> {a.status}")
+
+
+# ---- coded acceptance gates -------------------------------------------------
+def cmd_verify(a):
+    import subprocess
+    tasks = _fold_tasks()
+    t = tasks.get(a.task)
+    if not t:
+        _die(f"no such task '{a.task}'")
+    verify_cmd = t.get("verify")
+    if not verify_cmd:
+        # No verify command set on this task -> trivially passing.
+        _append(_p("board", "tasks.jsonl"), {"ts": now(), "id": a.task, "verified": True})
+        result = {"task": a.task, "verified": True, "trivial": True}
+        print(json.dumps(result, indent=2) if a.json else f"task '{a.task}' has no verify command — trivially verified")
+        return
+    claimant = t.get("claimed_by")
+    worktree = os.getcwd()
+    if claimant:
+        reg = _read_json(_p("registry", f"{claimant}.json"))
+        if reg and reg.get("worktree"):
+            worktree = reg["worktree"]
+    proc = subprocess.run(verify_cmd, shell=True, cwd=worktree, env=os.environ.copy())
+    if proc.returncode == 0:
+        _append(_p("board", "tasks.jsonl"), {"ts": now(), "id": a.task, "verified": True})
+        result = {"task": a.task, "verified": True, "returncode": proc.returncode}
+        print(json.dumps(result, indent=2) if a.json else f"task '{a.task}' verified (rc=0)")
+    else:
+        attempts = t.get("attempts", 0) + 1
+        _append(_p("board", "tasks.jsonl"), {"ts": now(), "id": a.task, "verified": False, "attempts": attempts})
+        result = {"task": a.task, "verified": False, "returncode": proc.returncode, "attempts": attempts}
+        if a.json:
+            print(json.dumps(result, indent=2))
+        else:
+            print(f"coord: task '{a.task}' verify failed (rc={proc.returncode}), attempts={attempts}",
+                  file=sys.stderr)
+        sys.exit(proc.returncode if proc.returncode != 0 else 1)
 
 
 # ---- leases (public lock cmds) --------------------------------------------
@@ -600,8 +643,13 @@ def build_parser():
 
     at = sub.add_parser("add-task"); at.set_defaults(func=cmd_add_task)
     at.add_argument("--id", required=True); at.add_argument("--desc", default=""); at.add_argument("--deps", default="")
+    at.add_argument("--verify", help="shell command that must exit 0 for this task to be accepted")
+    at.add_argument("--max-attempts", dest="max_attempts", type=int, help="max failed verify attempts before escalating")
 
     sub.add_parser("tasks").set_defaults(func=cmd_tasks)
+
+    vf = sub.add_parser("verify"); vf.set_defaults(func=cmd_verify)
+    vf.add_argument("--task", required=True); vf.add_argument("--json", action="store_true")
 
     cl = sub.add_parser("claim"); cl.set_defaults(func=cmd_claim)
     cl.add_argument("--session", required=True); cl.add_argument("--task", required=True)

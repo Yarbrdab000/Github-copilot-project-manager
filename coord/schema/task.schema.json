@@ -52,6 +52,24 @@
       "type": "integer",
       "minimum": 0,
       "description": "desired-state version at the moment of claim (present on the claim event); enables detecting silently-stale work."
+    },
+    "verify": {
+      "type": "string",
+      "description": "Shell command string that must exit 0 to accept the task (present on the add-task event)."
+    },
+    "max_attempts": {
+      "type": "integer",
+      "minimum": 0,
+      "description": "Max failed verify attempts before the task is escalated as a blocker (present on the add-task event)."
+    },
+    "attempts": {
+      "type": "integer",
+      "minimum": 0,
+      "description": "Number of failed verify attempts so far (present on a failing verify event)."
+    },
+    "verified": {
+      "type": "boolean",
+      "description": "Whether the last verify run passed (present on a verify event)."
     }
   }
 }
