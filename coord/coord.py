@@ -786,15 +786,24 @@ def cmd_tick(a):
     claimed_count = sum(1 for t in tasks.values() if t["status"] == "claimed")
     idle_workers = [s for s in registries if _is_idle(s)]
     for t in tasks.values():
-        if t["status"] != "open" or t.get("claimed_by"):
+        if t["status"] != "open":
             continue
+        claimed_by = t.get("claimed_by")
+        # A task is dispatchable when unclaimed, OR when its lingering claimant is stale.
+        # (The locked reference fold's `is not None` guard means a stale claimant's id
+        # lingers after reap's `claimed_by: None` event -- see AUTONOMY_SPEC gap. Do not
+        # "fix" the fold; treat a stale claimant as no claimant for dispatch purposes.)
+        if claimed_by and not _heartbeat_stale(claimed_by):
+            continue  # a LIVE claimant still holds this task; not ours to dispatch
         if any(tasks.get(d, {}).get("status") != "done" for d in t.get("deps", [])):
             continue
         if max_parallel is not None and claimed_count >= max_parallel:
             break
-        if not idle_workers:
+        candidates = [w for w in idle_workers if w != claimed_by]
+        if not candidates:
             break
-        worker = idle_workers.pop(0)
+        worker = candidates[0]
+        idle_workers.remove(worker)
         _send_message("tick", worker, f"task '{t['id']}' is ready and unclaimed; claim it", as_of=version)
         dispatched.append({"task": t["id"], "to": worker})
         claimed_count += 1  # advisory: reserve capacity against max_parallel for this pass

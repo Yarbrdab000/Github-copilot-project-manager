@@ -103,6 +103,43 @@ def test_tick_reaps_stale_claimed_task_to_open(coord):
     assert _fold_task(coord, "dead-owner-task")["status"] == "open"
 
 
+# --- gap fix: tick re-dispatches a task reaped from a dead worker -----------
+def test_tick_redispatches_reaped_task_to_live_worker(coord):
+    _register(coord, "w1")  # live, idle worker -> should receive the re-dispatch
+    coord("add-task", "--id", "orphan-task", "--desc", "d")
+    # dead1 is never registered -> _heartbeat_stale(dead1) is True, simulating a dead claimant
+    r = coord("claim", "--session", "dead1", "--task", "orphan-task")
+    assert r.returncode == 0, r.stderr
+
+    tick = coord("tick")
+    assert tick.returncode == 0, tick.stderr
+    report = json.loads(tick.stdout)
+
+    # the reap step folds the task back to 'open', but the reference fold's
+    # `is not None` guard means the stale claimed_by="dead1" lingers in the fold
+    # (see AUTONOMY_SPEC gap) -- dispatch must still treat this task as dispatchable.
+    assert any(d["task"] == "orphan-task" and d["to"] == "w1" for d in report["dispatched"]), report["dispatched"]
+    assert _fold_task(coord, "orphan-task")["status"] == "open"
+
+
+# --- regression guard: a live failing-verify claimant's requeue is NOT re-dispatched --
+def test_tick_does_not_dispatch_task_requeued_from_live_failing_verify(coord):
+    _register(coord, "w-idle")  # live, idle worker present as a dispatch candidate
+    _register(coord, "worker-fail2")
+    coord("add-task", "--id", "gate-fail2", "--desc", "d", "--verify", FAIL_CMD, "--max-attempts", "5")
+    coord("claim", "--session", "worker-fail2", "--task", "gate-fail2")
+    coord("complete", "--session", "worker-fail2", "--task", "gate-fail2")
+
+    tick = coord("tick")
+    assert tick.returncode == 0, tick.stderr
+    report = json.loads(tick.stdout)
+
+    # this task is handled by the notify-claimant retry path (requeued), not dispatch --
+    # dispatching it to a second worker would double-work it.
+    assert any(r["task"] == "gate-fail2" for r in report["requeued"])
+    assert not any(d["task"] == "gate-fail2" for d in report["dispatched"])
+
+
 # --- §7.2 tick runs a passing verify on a done task -> stays done, gains verified --
 def test_tick_runs_passing_verify_and_marks_verified(coord):
     _register(coord, "worker-pass")
