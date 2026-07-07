@@ -143,6 +143,10 @@ def cmd_checkpoint(a):
     stop = _stop_flags(a.session)
     state = _read_json(_p("state", "desired.json"), {"version": 0, "desired": {}})
     fresh, stale = _inbox_partition(a.session, state.get("version", 0))
+    # continue: true when this session holds unfinished (claimed, not-done) work --
+    # a machine-readable "keep going, don't yield the turn" signal (AUTONOMY_SPEC §6).
+    tasks = _fold_tasks()
+    keep_going = any(t["status"] == "claimed" and t.get("claimed_by") == a.session for t in tasks.values())
     out = {
         "session": a.session,
         "time": iso(),
@@ -151,6 +155,7 @@ def cmd_checkpoint(a):
         "desired": state.get("desired", {}),
         "messages": fresh,                  # act on these
         "stale_messages_skipped": len(stale),
+        "continue": keep_going,
     }
     print(json.dumps(out, indent=2))
     if stop:
@@ -718,14 +723,17 @@ def _send_message(sender: str, to: str, body: str, as_of: int | None, ttl: int |
     _append(_p("inbox", f"{to}.jsonl"), msg)
 
 
-def cmd_tick(a):
-    """Perform ONE deterministic reconciliation pass and report the effects as JSON.
+def _tick_once() -> dict:
+    """Perform ONE deterministic reconciliation pass and return the effects report.
 
-    HARD INVARIANT (AUTONOMY_SPEC §3.3): this command never changes `authorized_phase`,
+    HARD INVARIANT (AUTONOMY_SPEC §3.3): this never changes `authorized_phase`,
     never approves/rejects a proposal, and never performs a git write. It only reads
     desired-state and reconciles WITHIN the current human authorization — dispatch and
     stall-nudge steps are advisory (they queue messages; delivery/waking a session is a
     runtime adapter's job, not this command's).
+
+    Shared by `cmd_tick` (single pass, prints once) and `cmd_run` (the thin loop
+    wrapper, which calls this repeatedly) so both go through the identical code path.
     """
     st = _read_json(_p("state", "desired.json"), {"version": 0, "desired": {}})
     version = st.get("version", 0)
@@ -837,7 +845,7 @@ def cmd_tick(a):
     # 6. surface open escalations for the human/navigator to act on.
     awaiting_decision = [e for e in _read_escalations() if e.get("status") == "open"]
 
-    report = {
+    return {
         "reaped": reaped,
         "verified": verified,
         "requeued": requeued,
@@ -846,7 +854,31 @@ def cmd_tick(a):
         "failed": failed,
         "awaiting_decision": awaiting_decision,
     }
-    print(json.dumps(report, indent=2))
+
+
+def cmd_tick(a):
+    print(json.dumps(_tick_once(), indent=2))
+
+
+def cmd_run(a):
+    """Thin loop wrapper (AUTONOMY_SPEC §3.4): repeatedly call the same tick pass
+    `coord tick` uses, sleeping `--interval` seconds between passes. ALL reconciliation
+    logic lives in `_tick_once()` -- this command only sleeps, loops, and counts.
+
+    Stops after `--max-ticks` passes (`--once` == `--max-ticks 1`), or immediately
+    (before running another pass) once a fleet-wide STOP flag is set. Never touches
+    `authorized_phase` or proposals itself -- it inherits tick's invariant by construction."""
+    max_ticks = 1 if a.once else a.max_ticks
+    count = 0
+    while max_ticks is None or count < max_ticks:
+        if _p("control", "STOP").exists():
+            break
+        print(json.dumps(_tick_once(), indent=2))
+        count += 1
+        if max_ticks is not None and count >= max_ticks:
+            break
+        if a.interval:
+            time.sleep(a.interval)
 
 
 # ---- arg parsing ----------------------------------------------------------
@@ -920,6 +952,11 @@ def build_parser():
 
     tk = sub.add_parser("tick"); tk.set_defaults(func=cmd_tick)
     tk.add_argument("--json", action="store_true", help="accepted for symmetry; tick always prints JSON")
+
+    rn = sub.add_parser("run"); rn.set_defaults(func=cmd_run)
+    rn.add_argument("--interval", type=float, default=5.0, help="seconds to sleep between tick passes")
+    rn.add_argument("--max-ticks", dest="max_ticks", type=int, default=None, help="stop after this many passes (default: unbounded)")
+    rn.add_argument("--once", action="store_true", help="equivalent to --max-ticks 1")
     return p
 
 

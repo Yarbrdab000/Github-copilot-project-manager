@@ -22,3 +22,5 @@ Operating rules:
   orchestrator.
 - Take a `coord lock` before touching any shared resource, and release it when done. Never
   `git push` or switch off your session branch — the hook blocks these too.
+- Self-continue: after each `coord checkpoint`, if its `continue` field is `true` keep working
+  the next unit immediately — don't yield the turn (see the worker skill's self-continue rule).

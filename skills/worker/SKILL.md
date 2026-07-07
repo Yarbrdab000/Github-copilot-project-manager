@@ -41,3 +41,11 @@ being reaped out from under you.
 - Report back to the orchestrator when useful:
   `coord send --from $ID --to orchestrator --body "<result>" --as-of <desired_version>`.
 - Do a final `coord checkpoint --session $ID` before you stop.
+
+## Self-continue directive
+
+After every `coord checkpoint`, look at the `continue` field it prints (AUTONOMY_SPEC §6):
+if it is `true` — you still hold a `claimed` task that is not `done` — **immediately continue
+the next unit of work; do not yield the turn.** Only yield when: your task reaches `done`
+(`continue` goes `false`), a `stop` flag is set at checkpoint, or you must `escalate` (raise a
+`blocker`/`fork` and stop to await a decision). Do not sit idle mid-task waiting to be re-prompted.
