@@ -11,7 +11,11 @@ with the ``COORD_SESSION`` env var), then:
   * write tools (edit/create/str_replace/write/create_file/apply_patch): **deny** if the
     target path escapes the worktree or matches none of the session's ``owned_paths`` globs.
   * ``bash``: best-effort **deny** of ``git push``, branch switches away from the session
-    branch, and redirects to absolute paths outside the worktree. Otherwise allow.
+    branch, and redirects to absolute paths outside the worktree. Also denies a non-
+    ``orchestrator`` role running ``coord add-task ... --verify ...`` (AUTONOMY_SPEC §4:
+    acceptance gates must originate from the human-approved plan, never be self-injected
+    by the code under verification) — covers the alias and spelled-out invocation, and any
+    segment of a compound (``&&``/``;``/``|``) command. Otherwise allow.
   * read tools (grep/glob/view/...): always **allow**.
 
 A ``navigator``-role session is special (NAVIGATOR_SPEC §4): all file-editing
@@ -143,9 +147,14 @@ def _check_write(target_path: str, cwd: str, worktree: str, owned_paths):
     return "deny", f"'{rel}' is not within this session's owned paths ({list(owned_paths)})"
 
 
-def _check_bash(command: str, session_branch: str, worktree: str):
+def _check_bash(command: str, session_branch: str, worktree: str, role: str = ""):
     if not command:
         return "allow", None
+    if role != "orchestrator":
+        for seg in _SEG_SEP.split(command):
+            if _segment_has_add_task_verify(seg):
+                return "deny", ("only the orchestrator may attach a --verify acceptance gate; "
+                                 "it must come from the approved plan")
     if re.search(r"\bgit\s+push\b", command):
         return "deny", "git push is not permitted from a coordinated worker session"
     m = re.search(r"\bgit\s+(checkout|switch)\b(.*)", command)
@@ -197,6 +206,20 @@ def _normalize_coord(seg: str) -> str:
     """Collapse a spelled-out `python|py|python3 <path>coord.py` invocation to the
     `coord` alias, so the allow-list can't be bypassed by not using the alias."""
     return re.sub(r"^\s*(?:python3?|py)\s+\S*coord\.py\b", "coord", seg.strip())
+
+
+def _segment_has_add_task_verify(seg: str) -> bool:
+    """True if this segment invokes `coord add-task` (alias or spelled-out
+    `python coord/coord.py add-task`) with a `--verify` flag. Quoted spans are
+    stripped first so a literal '--verify' INSIDE the task's own quoted command/desc
+    string is not falsely matched, but a real --verify flag token is (AUTONOMY_SPEC §4:
+    acceptance gates must come from the approved plan, never be self-injected)."""
+    stripped = _strip_quoted(seg)
+    norm = _normalize_coord(stripped)
+    tokens = norm.split()
+    if len(tokens) < 2 or tokens[0] != "coord" or tokens[1] != "add-task":
+        return False
+    return any(t == "--verify" or t.startswith("--verify=") for t in tokens[2:])
 
 
 def _nav_segment_allowed(seg: str) -> bool:
@@ -288,7 +311,7 @@ def main() -> None:
 
     if tool == "bash":
         command = args.get("command") or args.get("cmd") or ""
-        _emit(*_check_bash(str(command), branch, worktree))
+        _emit(*_check_bash(str(command), branch, worktree, role))
 
     target = None
     for k in PATH_KEYS:
