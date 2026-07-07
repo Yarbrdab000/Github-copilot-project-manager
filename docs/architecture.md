@@ -225,3 +225,62 @@ The invariant this preserves: **the navigator can influence the fleet only by pr
 Every path by which its intent reaches a worker runs through the human-gated version bump and
 the checkpoint the worker already performs. See [`quickstart.md`](./quickstart.md) Walkthrough
 C for a runnable end-to-end trace.
+
+## 8. The autonomy loop: `tick`, `run`, and the honest runtime seam
+
+§2–7 describe how sessions coordinate; this section describes how the fleet **reconciles
+itself** without a human driving every step, and where that automation honestly stops.
+
+### `tick`: one pure reconciliation pass
+
+`coord tick` is the keystone: a single, deterministic pass that reaps dead sessions, runs coded
+acceptance gates (`--verify`), requeues or escalates on repeated failure, advises dispatch of
+ready work to idle workers, nudges a claimant whose heartbeat is aging, enforces budgets, and
+surfaces open escalations — then returns. It is built from the **same primitives** the rest of
+the CLI already uses (`_reap_once`, the verify/escalate helpers), so there is exactly one
+reap/verify/escalate implementation, not a duplicate "autonomous" copy.
+
+```mermaid
+flowchart TD
+    T[coord tick — one pass] --> R[1. reap dead sessions<br/>release stale leases, requeue claimed tasks]
+    T --> V[2. verify acceptance<br/>run --verify on done, unverified tasks]
+    V -->|pass| VOK[stays done, verified:true]
+    V -->|fail, attempts < max| REQ[requeue to open<br/>notify prior claimant]
+    V -->|fail, attempts >= max| FAIL[mark failed<br/>open a blocker escalation]
+    T --> D[3. dispatch (advisory)<br/>message an idle worker to claim ready work]
+    T --> N[4. stall nudge (advisory)<br/>message an aging-but-alive claimant]
+    T --> B[5. budgets<br/>failed+escalate past max_attempts/deadline;<br/>coord stop past max_parallel/time_budget]
+    T --> S[6. surface<br/>open escalations -> awaiting_decision]
+```
+
+**HARD INVARIANT**: `tick` never writes `authorized_phase`, never approves/rejects a proposal,
+and never performs a git operation. It reconciles strictly *within* the human's current
+authorization — it is a fast, safe, re-runnable pass, not a planning or governance act.
+
+### `run`: the thin, bounded loop
+
+`coord run [--interval SEC] [--max-ticks N] [--once]` is the only non-pure autonomy command, and
+it is deliberately thin: it calls the exact same tick pass in a loop, sleeping `--interval`
+seconds between passes, and stops after `--max-ticks` passes (`--once` = 1) or as soon as a
+fleet-wide `STOP` is set. **All reconciliation logic lives in `tick`** — `run` contributes
+nothing but sleeping, looping, and counting, so its behavior is exactly `tick`'s behavior,
+replayed.
+
+### The honest runtime seam: dispatch is advisory, not delivery
+
+`tick`'s dispatch and stall-nudge steps are **advisory**: they *record* a directive — "worker X,
+claim task Y" — as a message in X's inbox. That is all `coord` can do from the filesystem. It
+cannot reach into a fully-idle OS-level session and make it look at that message; **waking** a
+dormant session (or restarting a crashed process) is a runtime adapter's job, sitting outside
+`coord` entirely. This is intentional, not a gap: a stdlib-only, offline filesystem control
+plane has no channel to a process that isn't already polling it.
+
+The other half of the seam is the worker's own **self-continue** loop: every `coord checkpoint`
+now reports a `continue` boolean — true while the calling session still holds an unfinished
+(`claimed`, not `done`) task. A worker that is still running checks this at each checkpoint and
+keeps going without waiting to be re-prompted; it only yields the turn when its task reaches
+`done`, `stop` is set, or it must escalate. Together, `tick`'s advisory dispatch/nudge messages
+and the worker's `continue`-driven self-loop cover the reconciliation logic completely — the one
+piece genuinely left to the runtime is *waking a session that has gone fully idle*, which no
+in-process, offline tool can do. See [`quickstart.md`](./quickstart.md) Walkthrough D for a
+runnable trace of a failing acceptance gate driving `run` all the way to an open escalation.

@@ -25,7 +25,15 @@ output, and exit code.
 6. **Messages are a fallback channel with staleness.** Direct messages carry an `as_of`
    desired-state version and/or a TTL; anything outdated is filtered out at the checkpoint.
 7. **The checkpoint is the coordination beat.** `coord checkpoint` heartbeats, checks
-   stop-flags, surfaces fresh messages, and returns the current desired state — in one call.
+   stop-flags, surfaces fresh messages, and returns the current desired state — plus a
+   `continue` flag telling the calling session whether it still has unfinished claimed work.
+8. **Acceptance is coded, not claimed.** A task can carry a `--verify` command; `coord verify`
+   (by hand) or `coord tick` (automatically) runs it, and only a passing exit code marks the
+   task truly accepted — repeated failure requeues, then escalates.
+9. **`tick`/`run` reconcile automatically, within human authorization.** `coord tick` is one
+   pure reconciliation pass (reap, verify, dispatch, nudge, budgets, surface escalations);
+   `coord run` is a thin bounded loop over it. Neither ever changes `authorized_phase` or
+   approves a proposal — see [`architecture.md`](./architecture.md) §8.
 
 ## Invariants
 
@@ -95,7 +103,8 @@ $ coord checkpoint --session editor
   "desired_version": 2,
   "desired": { "target_palette": "v3" },
   "messages": [ ... fresh messages addressed to editor ... ],
-  "stale_messages_skipped": 1
+  "stale_messages_skipped": 1,
+  "continue": false
 }
 ```
 
@@ -103,6 +112,20 @@ Then: if `stop` is non-empty, **halt now** (the command also exits `3`); act onl
 `messages`; reconcile your behavior to `desired`. Note `checkpoint` does **not** advance the
 inbox cursor — use `inbox` to consume messages. See the ritual in
 [`skills/coordination-protocol/SKILL.md`](../skills/coordination-protocol/SKILL.md).
+
+`continue` is a machine-readable self-continue signal (AUTONOMY_SPEC §6): **true** when the
+calling session currently holds a `claimed` task whose folded status is not yet `done` —
+i.e. there is unfinished work in flight and the session should keep going without waiting to
+be re-prompted. **false** once the task is `done` (or there is no claimed task at all):
+
+```
+$ coord checkpoint --session w1     # w1 holds an unfinished claimed task
+{ ..., "continue": true }
+
+$ coord complete --session w1 --task ship-thing
+$ coord checkpoint --session w1     # task is now done
+{ ..., "continue": false }
+```
 
 ### `coord state show` / `coord state set --key KEY --value JSON [--session ID]`
 Read or update the versioned declarative desired state. `set` parses `--value` as JSON when it
@@ -166,14 +189,25 @@ $ coord state reject --session orch --id 1783358611618012800 --reason "staying o
 rejected 1783358611618012800 (version unchanged)
 ```
 
-### `coord add-task --id ID [--desc TEXT] [--deps CSV]`
+### `coord add-task --id ID [--desc TEXT] [--deps CSV] [--verify CMD] [--max-attempts N]`
 Append a new open task to the board. `--deps` is a comma-separated list of task ids that must
-be `done` before this task can be claimed.
+be `done` before this task can be claimed. `--verify` attaches a coded acceptance gate — a
+shell command that must exit `0` for the task to be truly accepted (see `coord verify` and
+`coord tick`, below); `--max-attempts` bounds how many failing verifies are tolerated before the
+task is marked `failed` and escalated (default from `desired.max_attempts_default`, else `1`).
 
 ```
 $ coord add-task --id write-mapper --desc "build the field mapper" --deps research-formatting
 added task write-mapper
+
+$ coord add-task --id ship-thing --desc "ship the thing" --verify "pytest -q tests/thing" --max-attempts 2
+added task ship-thing
 ```
+
+A `--verify` acceptance gate may only be attached by the `orchestrator` role — the write-scope
+hook denies `add-task ... --verify` for any other role, so a gate always comes from the
+human-approved plan, never from the code being verified (see
+[`hooks/README.md`](../hooks/README.md)).
 
 ### `coord tasks`
 List the current state of every task (the fold of the ledger).
@@ -218,6 +252,21 @@ that kept going cannot mark stale work done; it must re-claim first.
 ```
 $ coord complete --session w1 --task write-mapper --status done
 coord: cannot complete 'write-mapper': it is 'open' (claimed_by=w1), not claimed by 'w1' — it may have been requeued/invalidated; re-claim before completing   # exit 1
+```
+
+### `coord verify --task ID [--json]`
+Run a task's coded acceptance gate (its `--verify` command) in its claimant's registered
+worktree, right now, on demand. A task with no `--verify` set verifies **trivially** (always
+`verified: true`). On pass, appends `{verified: true}` to the ledger and exits `0`; on fail,
+appends `{verified: false, attempts: <current+1>}` and exits non-zero. This is the same check
+`coord tick` runs automatically for every `done` task — `verify` lets you run it by hand.
+
+```
+$ coord verify --task write-mapper
+task 'write-mapper' verified (rc=0)
+
+$ coord verify --task ship-thing
+coord: task 'ship-thing' failed verify (rc=1)   # exit 1
 ```
 
 ### `coord lock acquire --session ID --resource NAME [--ttl SEC]` / `coord lock release ...`
@@ -302,6 +351,74 @@ $ coord reap
   "reaped_locks": [ ["shared__theme.json", "worker1"] ],
   "requeued_tasks": [ ["write-mapper", "editor"] ]
 }
+```
+
+### `coord escalate --session ID --kind decision|blocker|fork --body TEXT [--task ID]`
+Raise a human-facing escalation — the seam a stuck worker or an automated `tick` pass uses to
+stop and ask, instead of guessing. Records the current desired-state version as `as_of` and
+writes `state/escalations/<eid>.json` with `status: "open"`.
+
+```
+$ coord escalate --session w1 --kind decision --body "which palette should v4 target?"
+escalated 1783452715807409000: [decision] from=w1 task=None - which palette should v4 target?
+```
+
+### `coord escalations [--json]`
+List every **open** escalation, most-recent first.
+
+```
+$ coord escalations
+  [decision] 1783452715807409000 from=w1 task=None  which palette should v4 target?
+```
+
+### `coord resolve --id EID [--note TEXT]`
+Close an escalation: sets `status: "resolved"` and records an optional `--note`. It then drops
+off the `escalations` list. Fails (exit 1) on an unknown id.
+
+```
+$ coord resolve --id 1783452715807409000 --note "picked v3, staying put"
+resolved 1783452715807409000
+
+$ coord escalations
+(no open escalations)
+```
+
+### `coord tick [--json]`
+**The keystone reconciliation pass** (AUTONOMY_SPEC §3.3): one deterministic sweep that reaps
+dead sessions, runs coded acceptance gates on `done` tasks, requeues-or-escalates on repeated
+verify failure, advisory-dispatches ready work to idle workers, advisory-nudges a claimant whose
+heartbeat is aging, enforces budgets, and surfaces open escalations. Always prints JSON and
+exits `0`. See [`architecture.md`](./architecture.md) §8 for the full step order and the hard
+invariant it upholds (never touches `authorized_phase`, never approves/rejects a proposal,
+never performs a git operation).
+
+```
+$ coord tick
+{
+  "reaped": [],
+  "verified": [],
+  "requeued": [],
+  "dispatched": [],
+  "nudged": [],
+  "failed": [
+    { "task": "ship-thing", "attempts": 1, "escalation": "1783452744369564200" }
+  ],
+  "awaiting_decision": [
+    { "eid": "1783452744369564200", "from": "tick", "kind": "blocker", "task": "ship-thing", ... }
+  ]
+}
+```
+
+### `coord run [--interval SEC] [--max-ticks N] [--once]`
+The thin, bounded loop wrapper around `tick` (AUTONOMY_SPEC §3.4) — **all** reconciliation logic
+lives in `tick`; `run` only sleeps `--interval` seconds between passes and counts them. Stops
+after `--max-ticks` passes (`--once` is `--max-ticks 1`), or immediately once a fleet-wide
+`STOP` is set — before starting another pass. Prints one JSON report per pass, in the same shape
+as `coord tick`.
+
+```
+$ coord run --once --interval 0
+{ "reaped": [], "verified": [], "requeued": [], "dispatched": [], "nudged": [], "failed": [], "awaiting_decision": [] }
 ```
 
 ---

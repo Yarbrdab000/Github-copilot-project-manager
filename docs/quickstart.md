@@ -271,6 +271,101 @@ dispatches, merges, edits, or self-approves. See
 
 ---
 
+## Walkthrough D — autonomous run to an escalation
+
+This traces a coded acceptance gate that keeps failing all the way through `coord run` to an
+open, human-facing escalation — no human babysits every step; the automation stops and asks
+exactly when it should. Use a scratch `COORD_ROOT`:
+
+```sh
+export COORD_ROOT="$(mktemp -d)"    # PowerShell: $env:COORD_ROOT = Join-Path $env:TEMP ([guid]::NewGuid())
+coord init
+coord register --session orch --role orchestrator --branch main      --paths ""
+coord register --session w1   --role editor       --branch feat/thing --paths "src/**"
+```
+
+### 1. The orchestrator adds a task with a failing acceptance gate
+
+`--max-attempts 1` means the very first failing verify already exhausts the budget:
+
+```sh
+coord add-task --id ship-thing --desc "ship the thing" \
+    --verify "python -c \"import sys; sys.exit(1)\"" --max-attempts 1
+# -> added task ship-thing
+```
+
+### 2. The worker claims it and (wrongly) marks it done
+
+```sh
+coord claim --session w1 --task ship-thing
+coord complete --session w1 --task ship-thing
+# -> w1 claimed ship-thing
+# -> task ship-thing -> done
+```
+
+`complete` only records the worker's *claim* that it's done — the coded gate hasn't run yet.
+
+### 3. `coord run --once` drives the tick that catches it
+
+```sh
+coord run --once --interval 0
+```
+```json
+{
+  "reaped": [],
+  "verified": [],
+  "requeued": [],
+  "dispatched": [],
+  "nudged": [],
+  "failed": [
+    { "task": "ship-thing", "attempts": 1, "escalation": "1783452744369564200" }
+  ],
+  "awaiting_decision": [
+    {
+      "eid": "1783452744369564200",
+      "from": "tick",
+      "kind": "blocker",
+      "task": "ship-thing",
+      "body": "task 'ship-thing' failed verify 1 time(s) (max_attempts=1); marked failed",
+      "status": "open",
+      "created": "2026-01-01T00:00:00Z",
+      "as_of": 0,
+      "resolved_note": null
+    }
+  ]
+}
+```
+
+The verify failed, `attempts` (1) already met `max_attempts` (1), so `tick` marked the task
+`failed` and opened a `blocker` escalation in the same pass — it did not requeue-and-retry
+forever, and it did not silently leave `ship-thing` looking `done`.
+
+### 4. The board and the escalation queue both reflect it
+
+```sh
+coord tasks
+# -> [    failed] ship-thing           <- w1   ship the thing
+
+coord escalations
+# -> [ blocker] 1783452744369564200 from=tick task=ship-thing  task 'ship-thing' failed verify 1 time(s) (max_attempts=1); marked failed
+```
+
+### 5. A human (or the orchestrator on their behalf) resolves it
+
+```sh
+coord resolve --id 1783452744369564200 --note "known flaky check, disabling gate and re-scoping ship-thing"
+# -> resolved 1783452744369564200
+
+coord escalations
+# -> (no open escalations)
+```
+
+`tick` never retried past `max_attempts` on its own, and it never silently dropped the failure —
+it escalated once and stopped, exactly the honest runtime seam [`architecture.md`](./architecture.md)
+§8 describes: the control plane records the directive and the failure; a human makes the call.
+
+---
+
 ## Where to go next
 
 - A concrete, worked end-to-end scenario:
