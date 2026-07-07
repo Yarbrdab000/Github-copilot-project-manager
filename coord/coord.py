@@ -82,7 +82,7 @@ def _die(msg: str, code: int = 1):
 
 # ---- init -----------------------------------------------------------------
 def cmd_init(a):
-    for d in ("registry", "inbox", "cursor", "locks", "state", "log", "control", "board"):
+    for d in ("registry", "inbox", "cursor", "locks", "state", "log", "control", "board", "escalations"):
         _p(d).mkdir(parents=True, exist_ok=True)
     _p("state", "proposals").mkdir(parents=True, exist_ok=True)
     state = _p("state", "desired.json")
@@ -503,6 +503,67 @@ def cmd_verify(a):
         sys.exit(proc.returncode if proc.returncode != 0 else 1)
 
 
+# ---- escalations (the human/navigator interface) ---------------------------
+ESCALATION_KINDS = ("decision", "blocker", "fork")
+
+
+def _escalation_path(eid: str) -> Path:
+    return _p("escalations", f"{eid}.json")
+
+
+def cmd_escalate(a):
+    if a.kind not in ESCALATION_KINDS:
+        _die(f"--kind must be one of {ESCALATION_KINDS}, got '{a.kind}'")
+    st = _read_json(_p("state", "desired.json"), {"version": 0})
+    eid = str(time.time_ns())
+    esc = {
+        "eid": eid,
+        "from": a.session,
+        "kind": a.kind,
+        "task": a.task,
+        "body": a.body,
+        "status": "open",
+        "created": iso(),
+        "as_of": st.get("version", 0),
+        "resolved_note": None,
+    }
+    _atomic_write(_escalation_path(eid), json.dumps(esc, indent=2))
+    print(f"escalated {eid}: [{a.kind}] from={a.session} task={a.task} — {a.body}")
+
+
+def _read_escalations():
+    escs = []
+    for ef in sorted(_p("escalations").glob("*.json")):
+        esc = _read_json(ef, {})
+        if esc:
+            escs.append(esc)
+    return escs
+
+
+def cmd_escalations(a):
+    open_escs = [e for e in _read_escalations() if e.get("status") == "open"]
+    open_escs.sort(key=lambda e: e.get("eid", ""), reverse=True)
+    if a.json:
+        print(json.dumps(open_escs, indent=2))
+        return
+    if not open_escs:
+        print("(no open escalations)")
+        return
+    for e in open_escs:
+        print(f"  [{e['kind']:>8}] {e['eid']} from={e['from']} task={e.get('task')}  {e['body']}")
+
+
+def cmd_resolve(a):
+    path = _escalation_path(a.id)
+    esc = _read_json(path)
+    if esc is None:
+        _die(f"no such escalation '{a.id}'")
+    esc["status"] = "resolved"
+    esc["resolved_note"] = a.note
+    _atomic_write(path, json.dumps(esc, indent=2))
+    print(f"resolved {a.id}")
+
+
 # ---- leases (public lock cmds) --------------------------------------------
 def _heartbeat_stale(session: str | None) -> bool:
     if not session:
@@ -661,6 +722,16 @@ def build_parser():
     lk = sub.add_parser("lock"); lk.set_defaults(func=cmd_lock)
     lk.add_argument("action", choices=["acquire", "release"]); lk.add_argument("--session", required=True)
     lk.add_argument("--resource", required=True); lk.add_argument("--ttl", type=int, default=120)
+
+    es = sub.add_parser("escalate"); es.set_defaults(func=cmd_escalate)
+    es.add_argument("--session", required=True); es.add_argument("--kind", required=True, choices=list(ESCALATION_KINDS))
+    es.add_argument("--body", required=True); es.add_argument("--task", default=None)
+
+    esl = sub.add_parser("escalations"); esl.set_defaults(func=cmd_escalations)
+    esl.add_argument("--json", action="store_true")
+
+    rs = sub.add_parser("resolve"); rs.set_defaults(func=cmd_resolve)
+    rs.add_argument("--id", required=True); rs.add_argument("--note", default=None)
 
     sd = sub.add_parser("send"); sd.set_defaults(func=cmd_send)
     sd.add_argument("--from", dest="sender", required=True); sd.add_argument("--to", required=True)
