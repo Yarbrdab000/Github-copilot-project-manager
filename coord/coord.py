@@ -442,7 +442,7 @@ def _fold_tasks():
         t = tasks.setdefault(tid, {"id": tid, "status": "open", "deps": [], "claimed_by": None,
                                     "attempts": 0, "verified": False})
         for k in ("desc", "deps", "status", "claimed_by", "claimed_at_version",
-                  "verify", "max_attempts", "attempts", "verified"):
+                  "verify", "max_attempts", "attempts", "verified", "owned_by"):
             if k in ev and ev[k] is not None:
                 t[k] = ev[k]
     return tasks
@@ -1032,11 +1032,12 @@ def _send_message(sender: str, to: str, body: str, as_of: int | None, ttl: int |
 def _tick_once() -> dict:
     """Perform ONE deterministic reconciliation pass and return the effects report.
 
-    HARD INVARIANT (AUTONOMY_SPEC §3.3): this never changes `authorized_phase`,
-    never approves/rejects a proposal, and never performs a git write. It only reads
-    desired-state and reconciles WITHIN the current human authorization — dispatch and
-    stall-nudge steps are advisory (they queue messages; delivery/waking a session is a
-    runtime adapter's job, not this command's).
+    HARD INVARIANT (AUTONOMY_SPEC §3.3, extended by COCKPIT_SPEC §3.5 to the spawn
+    step): this never changes `authorized_phase` or `desired.version`, never
+    approves/rejects a plan or proposal, and never performs a git write. It only reads
+    desired-state and reconciles WITHIN the current human authorization — dispatch,
+    stall-nudge, and spawn are all advisory (they queue messages/directives; actually
+    spawning or waking a session is a runtime adapter's job, not this command's).
 
     Shared by `cmd_tick` (single pass, prints once) and `cmd_run` (the thin loop
     wrapper, which calls this repeatedly) so both go through the identical code path.
@@ -1088,12 +1089,53 @@ def _tick_once() -> dict:
     tasks = _fold_tasks()
     registries = {rp.stem: _read_json(rp, {}) for rp in _p("registry").glob("*.json")}
 
+    # 3. spawn (COCKPIT_SPEC §3.5): ensure declared-but-not-live fleet workers that own
+    # needed work get a `spawn` directive, capped at `max_concurrent`. Purely advisory --
+    # `coord` never spawns/wakes a session itself; a runtime adapter (Phase 7) consumes
+    # the directives ledger and calls the host's real spawn capability. Runs BEFORE
+    # dispatch so a freshly-declared worker can be seen as a dispatch candidate once the
+    # adapter has actually spawned it (a later tick, once it registers and heartbeats).
+    spawned = []
+    fleet = _get_fleet(desired)
+    declared_workers = fleet.get("workers") or []
+    max_concurrent = fleet.get("max_concurrent", 0)
+    if declared_workers:
+        live_ids = {w["id"] for w in declared_workers if not _heartbeat_stale(w.get("id"))}
+        # a task with owned_by: null owns no worker and never makes anyone "missing".
+        needed_ids = {t.get("owned_by") for t in tasks.values()
+                      if t.get("owned_by") and t["status"] in ("open", "claimed")}
+        missing_workers = [w for w in declared_workers
+                            if w.get("id") in needed_ids and w.get("id") not in live_ids]
+        # idempotency: a missing worker with an already-queued (unconsumed -- there is no
+        # consumer yet) spawn directive counts toward the cap but is NOT re-emitted.
+        existing_spawn_ids = {d.get("worker") for d in _read_jsonl(_p("state", "directives.jsonl"))
+                               if d.get("kind") == "spawn"}
+        already_in_flight = [w for w in missing_workers if w.get("id") in existing_spawn_ids]
+        new_candidates = [w for w in missing_workers if w.get("id") not in existing_spawn_ids]
+
+        capacity_used = len(live_ids) + len(already_in_flight)
+        capacity_remaining = max(max_concurrent - capacity_used, 0)
+        to_spawn, over_cap = new_candidates[:capacity_remaining], new_candidates[capacity_remaining:]
+
+        for w in to_spawn:
+            _append(_p("state", "directives.jsonl"), {
+                "kind": "spawn",
+                "worker": w.get("id"),
+                "owned_paths": w.get("owned_paths") or [],
+                "as_of": version,
+                "ts": iso(),
+            })
+            spawned.append(w.get("id"))
+
+        if over_cap:
+            _open_escalation("tick", "decision", "fleet at cap; raise max_concurrent or wait")
+
     def _is_idle(session: str) -> bool:
         if _heartbeat_stale(session):
             return False
         return not any(tt["status"] == "claimed" and tt["claimed_by"] == session for tt in tasks.values())
 
-    # 3. dispatch (advisory): ready, unclaimed tasks -> message an idle worker to claim.
+    # 4. dispatch (advisory): ready, unclaimed tasks -> message an idle worker to claim.
     # Tasks don't currently carry their own path set, so "owned_paths match the task" is
     # applied at the granularity we have: any idle, live, registered worker is a candidate.
     max_parallel = desired.get("max_parallel")
@@ -1122,7 +1164,7 @@ def _tick_once() -> dict:
         dispatched.append({"task": t["id"], "to": worker})
         claimed_count += 1  # advisory: reserve capacity against max_parallel for this pass
 
-    # 4. stall nudge (advisory): claimed task whose heartbeat is aging but not yet reap-stale.
+    # 5. stall nudge (advisory): claimed task whose heartbeat is aging but not yet reap-stale.
     for t in tasks.values():
         if t["status"] != "claimed":
             continue
@@ -1135,7 +1177,7 @@ def _tick_once() -> dict:
             _send_message("tick", claimant, f"task '{t['id']}' claimed but heartbeat is aging; continue", as_of=version)
             nudged.append(t["id"])
 
-    # 5. budgets: a global time-budget breach stops the fleet (never touches authorized_phase).
+    # 6. budgets: a global time-budget breach stops the fleet (never touches authorized_phase).
     time_budget = desired.get("time_budget_sec")
     if time_budget is not None:
         oldest_registered = None
@@ -1148,13 +1190,14 @@ def _tick_once() -> dict:
             if (now() - started) > time_budget:
                 cmd_stop(argparse.Namespace(session=None))
 
-    # 6. surface open escalations for the human/navigator to act on.
+    # 7. surface open escalations for the human/navigator to act on.
     awaiting_decision = [e for e in _read_escalations() if e.get("status") == "open"]
 
     return {
         "reaped": reaped,
         "verified": verified,
         "requeued": requeued,
+        "spawned": spawned,
         "dispatched": dispatched,
         "nudged": nudged,
         "failed": failed,

@@ -77,7 +77,7 @@ def test_run_max_ticks_performs_exactly_n_passes(coord):
     reports = _parse_json_objects(r.stdout)
     assert len(reports) == 3
     for rep in reports:
-        assert set(rep) == {"reaped", "verified", "requeued", "dispatched", "nudged", "failed", "awaiting_decision"}
+        assert set(rep) == {"reaped", "verified", "requeued", "spawned", "dispatched", "nudged", "failed", "awaiting_decision"}
 
 
 # --- §7.8 `run --once` is exactly one pass -----------------------------------
