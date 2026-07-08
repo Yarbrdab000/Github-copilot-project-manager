@@ -470,6 +470,163 @@ def cmd_tasks(a):
         print(f"  [{t['status']:>10}] {t['id']:<20} {by} {deps}  {t.get('desc','')}")
 
 
+# ---- plans (COCKPIT SPEC §3.2: append-only ledger + fold, like tasks) ------
+def _fold_plans():
+    """Fold the append-only plans ledger into current plan state (event sourcing,
+    same shape as `_fold_tasks`). The propose event carries `as_of`/`note`/`fleet`/
+    `tasks`; later approve/reject events only flip `status`."""
+    plans = {}
+    for ev in _read_jsonl(_p("state", "plans.jsonl")):
+        pid = ev.get("id")
+        if not pid:
+            continue
+        p = plans.setdefault(pid, {"id": pid, "status": "pending", "as_of": 0,
+                                    "note": "", "fleet": {}, "tasks": []})
+        for k in ("as_of", "note", "fleet", "tasks", "status"):
+            if k in ev and ev[k] is not None:
+                p[k] = ev[k]
+    return plans
+
+
+def _plan_validate(doc: dict, tasks_on_board: dict):
+    """Validate a proposed plan document (COCKPIT SPEC §3.2). Returns a list of error
+    strings; empty means valid. Pure — takes the current task board as a parameter so
+    it never reads disk itself (callers already have it)."""
+    errors = []
+    fleet = doc.get("fleet") or {}
+    workers = fleet.get("workers") or []
+    max_concurrent = fleet.get("max_concurrent")
+
+    if not isinstance(max_concurrent, int) or isinstance(max_concurrent, bool) or max_concurrent < 1:
+        errors.append(f"fleet.max_concurrent must be an int >= 1, got {max_concurrent!r}")
+
+    worker_ids = [w.get("id") for w in workers]
+    if len(worker_ids) != len(set(worker_ids)):
+        errors.append(f"fleet.workers ids must be unique, got {worker_ids}")
+
+    for w in workers:
+        if not w.get("owned_paths"):
+            errors.append(f"worker '{w.get('id')}' has no owned_paths")
+
+    for i in range(len(workers)):
+        for j in range(i + 1, len(workers)):
+            wa, wb = workers[i], workers[j]
+            if _owned_paths_overlap(wa.get("owned_paths") or [], wb.get("owned_paths") or []):
+                errors.append(
+                    f"workers '{wa.get('id')}' and '{wb.get('id')}' have overlapping owned_paths"
+                )
+
+    worker_id_set = set(worker_ids)
+    tasks = doc.get("tasks") or []
+    plan_task_ids = [t.get("id") for t in tasks]
+    if len(plan_task_ids) != len(set(plan_task_ids)):
+        errors.append(f"plan task ids must be unique, got {plan_task_ids}")
+    plan_task_id_set = set(plan_task_ids)
+
+    for t in tasks:
+        tid = t.get("id")
+        if tid in tasks_on_board:
+            errors.append(f"task '{tid}' already exists on the live board")
+        owned_by = t.get("owned_by")
+        if owned_by is not None and owned_by not in worker_id_set:
+            errors.append(f"task '{tid}' owned_by '{owned_by}' does not reference a declared worker")
+        for dep in t.get("deps") or []:
+            if dep not in plan_task_id_set:
+                errors.append(f"task '{tid}' dep '{dep}' does not reference a task in this plan")
+        if "verify" not in t:
+            errors.append(f"task '{tid}' is missing the 'verify' key (use null to opt out)")
+
+    return errors
+
+
+def _plan_read_doc(a) -> dict:
+    """Read the plan document from --file, or stdin when --file is absent."""
+    if getattr(a, "file", None):
+        return json.loads(Path(a.file).read_text(encoding="utf-8"))
+    return json.loads(sys.stdin.read())
+
+
+def cmd_plan(a):
+    if a.action == "propose":
+        _plan_propose(a)
+    elif a.action == "show":
+        _plan_show(a)
+
+
+def _plan_propose(a):
+    """Validate and write a PENDING plan to .coordination/state/plans.jsonl. Does NOT
+    bump desired.version (that happens at `plan approve`, Phase 3). Navigator-allowed."""
+    try:
+        doc = _plan_read_doc(a)
+    except (OSError, json.JSONDecodeError) as e:
+        _die(f"could not read plan document: {e}")
+        return
+
+    errors = _plan_validate(doc, _fold_tasks())
+    if errors:
+        _die("plan rejected:\n  " + "\n  ".join(errors))
+        return
+
+    st = _read_json(_p("state", "desired.json"), {"version": 0, "desired": {}})
+    current_fleet = _get_fleet(st.get("desired", {}))
+    proposed_fleet = doc.get("fleet") or {}
+    tasks = doc.get("tasks") or []
+
+    pid = str(time.time_ns())
+    ev = {
+        "ts": now(),
+        "id": pid,
+        "as_of": st.get("version", 0),
+        "note": doc.get("note", ""),
+        "fleet": proposed_fleet,
+        "tasks": tasks,
+        "status": "pending",
+    }
+    _append(_p("state", "plans.jsonl"), ev)
+    print(f"proposed plan {pid} (pending; desired.version unchanged at {st.get('version', 0)})")
+    print(f"  fleet: {json.dumps(current_fleet)} -> {json.dumps(proposed_fleet)}")
+    print(f"  tasks: 0 -> {len(tasks)}")
+    for t in tasks:
+        deps = (" deps=" + ",".join(t.get("deps") or [])) if t.get("deps") else ""
+        print(f"    + {t.get('id')} owned_by={t.get('owned_by')}{deps}")
+
+
+def cmd_plans(a):
+    """List pending plans: id, as_of, note, worker count, task count."""
+    plans = [p for p in _fold_plans().values() if p["status"] == "pending"]
+    if not plans:
+        print("(no pending plans)")
+        return
+    for p in sorted(plans, key=lambda x: x["id"]):
+        n_workers = len((p.get("fleet") or {}).get("workers") or [])
+        n_tasks = len(p.get("tasks") or [])
+        note = ("  note=" + p["note"]) if p.get("note") else ""
+        print(f"  {p['id']}  as_of={p['as_of']}  workers={n_workers}  tasks={n_tasks}{note}")
+
+
+def _plan_show(a):
+    """Print the full current -> proposed diff (fleet + task DAG) for a pending plan."""
+    if not a.id:
+        _die("`plan show` requires --id")
+    plans = _fold_plans()
+    p = plans.get(a.id)
+    if not p:
+        _die(f"no such plan '{a.id}'")
+        return
+    st = _read_json(_p("state", "desired.json"), {"version": 0, "desired": {}})
+    current_fleet = _get_fleet(st.get("desired", {}))
+    proposed_fleet = p.get("fleet") or {}
+    print(f"plan {p['id']}  status={p['status']}  as_of={p['as_of']}")
+    if p.get("note"):
+        print(f"  note: {p['note']}")
+    print(f"  fleet current:  {json.dumps(current_fleet)}")
+    print(f"  fleet proposed: {json.dumps(proposed_fleet)}")
+    print("  tasks (proposed):")
+    for t in p.get("tasks") or []:
+        deps = (" deps=" + ",".join(t.get("deps") or [])) if t.get("deps") else ""
+        print(f"    {t.get('id'):<20} owned_by={t.get('owned_by')}{deps}  {t.get('desc', '')}")
+
+
 def cmd_claim(a):
     tasks = _fold_tasks()
     t = tasks.get(a.task)
@@ -954,6 +1111,13 @@ def build_parser():
     at.add_argument("--max-attempts", dest="max_attempts", type=int, help="max failed verify attempts before escalating")
 
     sub.add_parser("tasks").set_defaults(func=cmd_tasks)
+
+    pl = sub.add_parser("plan"); pl.set_defaults(func=cmd_plan)
+    pl.add_argument("action", choices=["propose", "show"])
+    pl.add_argument("--file", help="path to a plan JSON document (default: read from stdin)")
+    pl.add_argument("--id", help="plan id (pid) for `plan show`")
+
+    sub.add_parser("plans").set_defaults(func=cmd_plans)
 
     vf = sub.add_parser("verify"); vf.set_defaults(func=cmd_verify)
     vf.add_argument("--task", required=True); vf.add_argument("--json", action="store_true")
