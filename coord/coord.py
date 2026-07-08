@@ -92,6 +92,48 @@ def cmd_init(a):
     print(f"initialized control plane at {root()}")
 
 
+# ---- fleet spec (COCKPIT SPEC §3.1) ---------------------------------------
+def _get_fleet(desired: dict) -> dict:
+    """Read the optional `fleet` object out of a `desired` dict (i.e. desired.json's
+    "desired" key). Absent on legacy planes -- missing must never crash a read, so this
+    normalizes to `{"max_concurrent": 0, "workers": []}` when there is no fleet declared
+    yet. Pure/read-only; does not write anything (fleet is first written by `plan
+    approve`, landing in a later phase)."""
+    fleet = desired.get("fleet") or {}
+    return {
+        "max_concurrent": fleet.get("max_concurrent", 0),
+        "workers": fleet.get("workers", []),
+    }
+
+
+def _normalize_owned_glob(glob_pat: str) -> str:
+    """Strip a trailing `/**` or `/*` so two owned-path globs can be compared as plain
+    path prefixes (COCKPIT SPEC §3.3)."""
+    for suffix in ("/**", "/*"):
+        if glob_pat.endswith(suffix):
+            return glob_pat[: -len(suffix)]
+    return glob_pat
+
+
+def _path_prefix_overlaps(a: str, b: str) -> bool:
+    """Path-segment-aware prefix check: true if one normalized path is a segment-wise
+    prefix of the other (or identical). Segment-aware so `src` does NOT match `src2` --
+    plain string prefixing would falsely overlap them."""
+    a_segs = [s for s in a.split("/") if s]
+    b_segs = [s for s in b.split("/") if s]
+    shorter, longer = (a_segs, b_segs) if len(a_segs) <= len(b_segs) else (b_segs, a_segs)
+    return shorter == longer[: len(shorter)]
+
+
+def _owned_paths_overlap(a_globs, b_globs) -> bool:
+    """True if any glob in `a_globs` overlaps any glob in `b_globs` (COCKPIT SPEC §3.3).
+    Pure/deterministic. Used to reject a fleet plan whose declared workers' owned paths
+    could collide under the write-scope hook."""
+    a_norm = [_normalize_owned_glob(g) for g in a_globs]
+    b_norm = [_normalize_owned_glob(g) for g in b_globs]
+    return any(_path_prefix_overlaps(x, y) for x in a_norm for y in b_norm)
+
+
 # ---- session lifecycle ----------------------------------------------------
 def cmd_register(a):
     reg = {
