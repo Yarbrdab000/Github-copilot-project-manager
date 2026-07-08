@@ -986,6 +986,110 @@ def cmd_status(a):
     cmd_tasks(a)
 
 
+# ---- cockpit (COCKPIT SPEC §3.6: single read-only aggregate view) ----------
+def _build_cockpit_view() -> dict:
+    """Read-only aggregate of the whole cockpit plane. Pure read: no writes, no
+    heartbeat/lock side effects -- safe to call anytime. Reuses the existing fold/
+    read helpers (`_get_fleet`, `_fold_tasks`, `_heartbeat_stale`, `_read_escalations`,
+    `_fold_plans`, the proposals reader, the directives ledger) rather than
+    reimplementing any state derivation."""
+    st = _read_json(_p("state", "desired.json"), {"version": 0, "desired": {}})
+    desired = st.get("desired", {})
+    fleet = _get_fleet(desired)
+    declared_workers = fleet.get("workers") or []
+    max_concurrent = fleet.get("max_concurrent", 0)
+
+    tasks = _fold_tasks()
+    by_status = {"open": [], "claimed": [], "done": [], "failed": []}
+    counts = {}
+    for t in tasks.values():
+        status = t.get("status", "open")
+        counts[status] = counts.get(status, 0) + 1
+        by_status.setdefault(status, []).append(t["id"])
+
+    live_ids = set()
+    workers_view = []
+    for w in declared_workers:
+        wid = w.get("id")
+        reg = _read_json(_p("registry", f"{wid}.json"), {})
+        stale = _heartbeat_stale(wid)
+        age = (now() - reg.get("heartbeat", 0)) if reg else None
+        if not stale:
+            live_ids.add(wid)
+        holds = next((t["id"] for t in tasks.values()
+                      if t.get("status") == "claimed" and t.get("claimed_by") == wid), None)
+        workers_view.append({
+            "id": wid,
+            "liveness": "stale" if stale else "fresh",
+            "heartbeat_age_sec": (int(age) if age is not None else None),
+            "task": holds,
+        })
+
+    escalations = _read_escalations()
+    decisions = [e for e in escalations if e.get("kind") == "decision" and e.get("status") == "open"]
+    blockers = [e for e in escalations if e.get("kind") == "blocker" and e.get("status") == "open"]
+
+    pending_plans = sorted(p["id"] for p in _fold_plans().values() if p.get("status") == "pending")
+    pending_proposals = sorted(
+        prop.get("pid") for pf in _p("state", "proposals").glob("*.json")
+        for prop in [_read_json(pf, {})] if prop.get("status") == "pending"
+    )
+
+    # no consumer exists yet (Phase 7), so every spawn directive ever emitted for a
+    # worker is "unconsumed" -- same idempotency notion used by tick's spawn step.
+    spawn_workers = sorted({d.get("worker") for d in _read_jsonl(_p("state", "directives.jsonl"))
+                            if d.get("kind") == "spawn"})
+
+    return {
+        "desired": {
+            "version": st.get("version", 0),
+            "authorized_phase": desired.get("authorized_phase"),
+            "fleet": {
+                "max_concurrent": max_concurrent,
+                "workers": [w.get("id") for w in declared_workers],
+            },
+        },
+        "tasks": {
+            "counts": counts,
+            "by_status": by_status,
+        },
+        "workers": workers_view,
+        "decisions": decisions,
+        "blockers": blockers,
+        "pending": {
+            "plans": pending_plans,
+            "proposals": pending_proposals,
+        },
+        "capacity": {
+            "live": len(live_ids),
+            "max_concurrent": max_concurrent,
+            "unconsumed_spawn_directives": len(spawn_workers),
+            "unconsumed_spawn_workers": spawn_workers,
+        },
+    }
+
+
+def cmd_cockpit(a):
+    view = _build_cockpit_view()
+    if getattr(a, "json", False):
+        print(json.dumps(view, indent=2))
+        return
+    d = view["desired"]
+    print(f"desired: version={d['version']} authorized_phase={d['authorized_phase']} "
+          f"fleet(max_concurrent={d['fleet']['max_concurrent']}, workers={d['fleet']['workers']})")
+    print("tasks:")
+    for status, ids in view["tasks"]["by_status"].items():
+        print(f"  {status:<8} {len(ids):>3}  {ids}")
+    print("workers:")
+    for w in view["workers"]:
+        print(f"  {w['id']:<12} {w['liveness']:<6} age={w['heartbeat_age_sec']}s task={w['task']}")
+    print(f"decisions: {len(view['decisions'])}  blockers: {len(view['blockers'])}")
+    print(f"pending: plans={view['pending']['plans']} proposals={view['pending']['proposals']}")
+    c = view["capacity"]
+    print(f"capacity: live={c['live']}/{c['max_concurrent']}  "
+          f"unconsumed_spawn={c['unconsumed_spawn_directives']} {c['unconsumed_spawn_workers']}")
+
+
 def _reap_once():
     """Release locks held by dead sessions and requeue their in-progress tasks.
     Returns (reaped_locks, requeued) — lists of (name, holder) tuples — without printing,
@@ -1320,6 +1424,9 @@ def build_parser():
     rn.add_argument("--interval", type=float, default=5.0, help="seconds to sleep between tick passes")
     rn.add_argument("--max-ticks", dest="max_ticks", type=int, default=None, help="stop after this many passes (default: unbounded)")
     rn.add_argument("--once", action="store_true", help="equivalent to --max-ticks 1")
+
+    ck = sub.add_parser("cockpit"); ck.set_defaults(func=cmd_cockpit)
+    ck.add_argument("--json", action="store_true", help="print the aggregate as JSON")
     return p
 
 
