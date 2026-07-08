@@ -1128,7 +1128,13 @@ def _tick_once() -> dict:
             spawned.append(w.get("id"))
 
         if over_cap:
-            _open_escalation("tick", "decision", "fleet at cap; raise max_concurrent or wait")
+            _CAP_DECISION = "fleet at cap; raise max_concurrent or wait"
+            already_open = any(
+                e.get("kind") == "decision" and e.get("status") == "open" and e.get("body") == _CAP_DECISION
+                for e in _read_escalations()
+            )
+            if not already_open:
+                _open_escalation("tick", "decision", _CAP_DECISION)
 
     def _is_idle(session: str) -> bool:
         if _heartbeat_stale(session):

@@ -173,6 +173,31 @@ def test_tick_over_cap_demand_opens_exactly_one_decision_escalation(coord, tmp_p
     assert after["desired"].get("authorized_phase") == before["desired"].get("authorized_phase") == 3
 
 
+# --- over-cap decision escalation must be deduped across repeated ticks (no spam) --------
+def test_tick_over_cap_decision_deduped_across_repeated_ticks(coord, tmp_path):
+    doc = _plan_doc(max_concurrent=1, worker_ids=["w-a", "w-b", "w-c"])
+    _propose_and_approve_plan(coord, doc, tmp_path)
+    assert len(_spawn_directives(coord)) == 1
+
+    coord("state", "set", "--session", "orch", "--key", "authorized_phase", "--value", "3")
+    before = json.loads(coord("state", "show").stdout)
+
+    for _ in range(3):
+        tick = coord("tick")
+        assert tick.returncode == 0, tick.stderr
+
+    assert len(_spawn_directives(coord)) == 1  # still no over-spawn after 3 ticks
+
+    decisions = [e for e in _escalations(coord) if e["kind"] == "decision"
+                 and e["status"] == "open"
+                 and e["body"] == "fleet at cap; raise max_concurrent or wait"]
+    assert len(decisions) == 1  # deduped, not re-opened on every tick
+
+    after = json.loads(coord("state", "show").stdout)
+    assert after["version"] == before["version"]
+    assert after["desired"].get("authorized_phase") == before["desired"].get("authorized_phase") == 3
+
+
 # --- idempotency: a second tick with the same still-not-live workers doesn't duplicate ---
 def test_tick_does_not_duplicate_spawn_directives_across_ticks(coord, tmp_path):
     doc = _plan_doc(max_concurrent=5, worker_ids=["w-a", "w-b"])
