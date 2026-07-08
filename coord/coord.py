@@ -551,6 +551,10 @@ def cmd_plan(a):
         _plan_propose(a)
     elif a.action == "show":
         _plan_show(a)
+    elif a.action == "approve":
+        _plan_approve(a)
+    elif a.action == "reject":
+        _plan_reject(a)
 
 
 def _plan_propose(a):
@@ -625,6 +629,109 @@ def _plan_show(a):
     for t in p.get("tasks") or []:
         deps = (" deps=" + ",".join(t.get("deps") or [])) if t.get("deps") else ""
         print(f"    {t.get('id'):<20} owned_by={t.get('owned_by')}{deps}  {t.get('desc', '')}")
+
+
+def _plan_approve(a):
+    """Apply a pending plan ATOMICALLY (COCKPIT_SPEC.md §3.2/§3.4, keystone). Models
+    `_state_approve`'s lock/transaction shape: serialize under the `__state__` lease,
+    re-validate against the CURRENT board (a task id may have landed since propose),
+    and only then perform every effect -- create tasks, set desired.fleet, bump
+    desired.version by exactly 1, mark the plan approved, and emit the initial capped
+    `spawn` directive batch. Never touches `authorized_phase` or any other desired
+    key. Human/orchestrator-gated (the navigator is DENIED this by the hook, Phase 6)."""
+    if not a.id:
+        _die("`plan approve` requires --id")
+        return
+    for _ in range(50):
+        if _acquire_raw("__state__", a.session or "state", 30):
+            break
+        time.sleep(0.1)
+    else:
+        _die("could not acquire state lock")
+        return
+    try:
+        plan = _fold_plans().get(a.id)
+        if not plan:
+            _die(f"no such plan '{a.id}'")
+            return
+        if plan["status"] != "pending":
+            _die(f"plan '{a.id}' is '{plan['status']}' — not pending")
+            return
+        # re-validate at approve time: the board may have moved since propose.
+        errors = _plan_validate(
+            {"fleet": plan.get("fleet") or {}, "tasks": plan.get("tasks") or []}, _fold_tasks()
+        )
+        if errors:
+            _die("plan approve rejected (re-validation failed):\n  " + "\n  ".join(errors))
+            return
+
+        # from here on, every effect must land -- no more validation failures possible.
+        for t in plan.get("tasks") or []:
+            ev = {
+                "ts": now(),
+                "id": t.get("id"),
+                "desc": t.get("desc", ""),
+                "deps": t.get("deps") or [],
+                "status": "open",
+                "claimed_by": None,
+            }
+            if t.get("owned_by") is not None:
+                ev["owned_by"] = t["owned_by"]
+            if t.get("verify") is not None:
+                ev["verify"] = t["verify"]
+            if t.get("max_attempts") is not None:
+                ev["max_attempts"] = t["max_attempts"]
+            _append(_p("board", "tasks.jsonl"), ev)
+
+        path = _p("state", "desired.json")
+        st = _read_json(path, {"version": 0, "desired": {}})
+        st.setdefault("desired", {})["fleet"] = plan.get("fleet") or {}
+        st["version"] = st.get("version", 0) + 1
+        st["updated"] = iso()
+        new_version = st["version"]
+        _atomic_write(path, json.dumps(st, indent=2))
+        _append(_p("board", "events.jsonl"),
+                {"ts": now(), "event": "plan_approved", "pid": a.id, "version": new_version})
+
+        _append(_p("state", "plans.jsonl"), {"ts": now(), "id": a.id, "status": "approved"})
+
+        fleet = plan.get("fleet") or {}
+        workers = fleet.get("workers") or []
+        max_concurrent = fleet.get("max_concurrent", 0)
+        spawned = []
+        for w in workers[:max_concurrent]:
+            _append(_p("state", "directives.jsonl"), {
+                "kind": "spawn",
+                "worker": w.get("id"),
+                "owned_paths": w.get("owned_paths") or [],
+                "as_of": new_version,
+                "ts": iso(),
+            })
+            spawned.append(w.get("id"))
+
+        print(f"approved {a.id}: {len(plan.get('tasks') or [])} tasks created; "
+              f"desired.fleet set; state version -> {new_version}")
+        if spawned:
+            print(f"  spawn directives: {spawned}")
+    finally:
+        _release_raw("__state__", a.session or "state")
+
+
+def _plan_reject(a):
+    """Mark a pending plan rejected. No version bump, no fleet change, no tasks, no
+    directives -- rejection is a pure no-op besides the ledger entry."""
+    if not a.id:
+        _die("`plan reject` requires --id")
+        return
+    plan = _fold_plans().get(a.id)
+    if not plan:
+        _die(f"no such plan '{a.id}'")
+        return
+    if plan["status"] != "pending":
+        _die(f"plan '{a.id}' is '{plan['status']}' — not pending")
+        return
+    _append(_p("state", "plans.jsonl"), {"ts": now(), "id": a.id, "status": "rejected"})
+    print(f"rejected plan {a.id} (version unchanged)")
 
 
 def cmd_claim(a):
@@ -1113,9 +1220,10 @@ def build_parser():
     sub.add_parser("tasks").set_defaults(func=cmd_tasks)
 
     pl = sub.add_parser("plan"); pl.set_defaults(func=cmd_plan)
-    pl.add_argument("action", choices=["propose", "show"])
+    pl.add_argument("action", choices=["propose", "show", "approve", "reject"])
     pl.add_argument("--file", help="path to a plan JSON document (default: read from stdin)")
-    pl.add_argument("--id", help="plan id (pid) for `plan show`")
+    pl.add_argument("--id", help="plan id (pid) for `plan show`/`plan approve`/`plan reject`")
+    pl.add_argument("--session", help="session id used as the state-lock holder for `plan approve`")
 
     sub.add_parser("plans").set_defaults(func=cmd_plans)
 

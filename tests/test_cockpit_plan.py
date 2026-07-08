@@ -7,8 +7,11 @@ no filesystem side effects.
 
 Phase 2 (CLI section below): `plan propose` / `plans` / `plan show` (§3.2, acceptance
 §7.1-§7.3) driven as a real subprocess against a throwaway COORD_ROOT, mirroring the
-`coord` fixture pattern in `tests/test_coord.py`. `plan approve`/`plan reject` are
-Phase 3 (keystone) and are intentionally NOT exercised here.
+`coord` fixture pattern in `tests/test_coord.py`.
+
+Phase 3 (final section below): `plan approve` / `plan reject` (§3.2/§3.4, acceptance
+§7.4-§7.5) -- the keystone human-gated seam that turns a pending plan into real tasks
++ fleet + spawn directives.
 """
 from __future__ import annotations
 
@@ -310,3 +313,165 @@ def test_plan_propose_produces_instance_valid_against_plan_schema(cli, tmp_path)
     schema = json.loads((SCHEMA_DIR / "plan.schema.json").read_text(encoding="utf-8"))
     errs = _schema_errors(lines[0], schema)
     assert not errs, f"plan.schema.json validation failed:\n  " + "\n  ".join(errs)
+
+
+# --- `coord plan approve` / `coord plan reject` CLI (§3.2/§3.4, §7.4-§7.5, keystone) ---
+
+def _read_jsonl_file(path: Path):
+    if not path.exists():
+        return []
+    return [json.loads(l) for l in path.read_text(encoding="utf-8").splitlines() if l.strip()]
+
+
+def _tasks_on_board(cli):
+    tasks = {}
+    for ev in _read_jsonl_file(cli.root / "board" / "tasks.jsonl"):
+        tid = ev.get("id")
+        if not tid:
+            continue
+        t = tasks.setdefault(tid, {"id": tid, "status": "open", "deps": [], "claimed_by": None})
+        for k in ("desc", "deps", "status", "claimed_by", "verify", "max_attempts", "owned_by"):
+            if k in ev and ev[k] is not None:
+                t[k] = ev[k]
+    return tasks
+
+
+def _plan_status(cli, pid):
+    status = None
+    for ev in _read_jsonl_file(cli.root / "state" / "plans.jsonl"):
+        if ev.get("id") == pid and "status" in ev:
+            status = ev["status"]
+    return status
+
+
+def _desired_full(cli):
+    return json.loads(cli("state", "show").stdout)
+
+
+def _propose_and_get_id(cli, doc, tmp_path):
+    r = _propose(cli, doc, tmp_path)
+    assert r.returncode == 0, r.stdout + r.stderr
+    return r.stdout.split()[2]
+
+
+# §7.4 — approve creates every task, sets fleet, bumps version by exactly 1,
+# leaves authorized_phase untouched, marks the plan approved, emits capped spawn directives
+def test_plan_approve_creates_tasks_sets_fleet_bumps_version(cli, tmp_path):
+    version_before = _desired_full(cli)["version"]
+    doc = _valid_plan_doc()
+    pid = _propose_and_get_id(cli, doc, tmp_path)
+
+    approved = cli("plan", "approve", "--id", pid)
+    assert approved.returncode == 0, approved.stdout + approved.stderr
+
+    tasks = _tasks_on_board(cli)
+    assert set(tasks.keys()) == {"api-model", "api-routes", "ui-page"}
+    assert tasks["api-model"]["status"] == "open"
+    assert tasks["api-model"]["owned_by"] == "w-api"
+    assert tasks["api-routes"]["deps"] == ["api-model"]
+    assert tasks["api-routes"]["verify"] == "pytest tests/api -q"
+    assert tasks["api-routes"]["max_attempts"] == 3
+    assert tasks["ui-page"]["owned_by"] == "w-ui"
+
+    desired_after = _desired_full(cli)
+    assert desired_after["desired"]["fleet"] == doc["fleet"]
+    assert desired_after["version"] == version_before + 1
+    # the keystone invariant: approve MUST NOT touch authorized_phase (or introduce it)
+    assert "authorized_phase" not in desired_after["desired"]
+
+    assert _plan_status(cli, pid) == "approved"
+
+    directives = _read_jsonl_file(cli.root / "state" / "directives.jsonl")
+    expected_n = min(len(doc["fleet"]["workers"]), doc["fleet"]["max_concurrent"])
+    assert len(directives) == expected_n
+    for d, w in zip(directives, doc["fleet"]["workers"]):
+        assert d["kind"] == "spawn"
+        assert d["worker"] == w["id"]
+        assert d["owned_paths"] == w["owned_paths"]
+        assert d["as_of"] == desired_after["version"]
+
+
+def test_plan_approve_spawn_directives_capped_at_max_concurrent(cli, tmp_path):
+    doc = _valid_plan_doc()
+    doc["fleet"]["max_concurrent"] = 1  # 2 workers declared, cap at 1
+    pid = _propose_and_get_id(cli, doc, tmp_path)
+
+    approved = cli("plan", "approve", "--id", pid)
+    assert approved.returncode == 0, approved.stdout + approved.stderr
+
+    directives = _read_jsonl_file(cli.root / "state" / "directives.jsonl")
+    assert len(directives) == 1
+    assert directives[0]["worker"] == doc["fleet"]["workers"][0]["id"]
+
+
+# §7.5 — reject leaves version + fleet unchanged, marks the plan rejected, no effects
+def test_plan_reject_leaves_version_and_fleet_unchanged(cli, tmp_path):
+    version_before = _desired_full(cli)["version"]
+    doc = _valid_plan_doc()
+    pid = _propose_and_get_id(cli, doc, tmp_path)
+
+    rejected = cli("plan", "reject", "--id", pid)
+    assert rejected.returncode == 0, rejected.stdout + rejected.stderr
+
+    desired_after = _desired_full(cli)
+    assert desired_after["version"] == version_before
+    assert "fleet" not in desired_after["desired"]
+    assert _tasks_on_board(cli) == {}
+    assert _read_jsonl_file(cli.root / "state" / "directives.jsonl") == []
+    assert _plan_status(cli, pid) == "rejected"
+
+
+# --- atomicity: a plan that no longer validates at approve time lands NOTHING ---
+def test_plan_approve_fails_atomically_when_task_id_lands_on_board_before_approve(cli, tmp_path):
+    doc = _valid_plan_doc()
+    pid = _propose_and_get_id(cli, doc, tmp_path)
+
+    # simulate a task with the same id landing on the board after propose, before approve
+    cli("add-task", "--id", "api-model")
+    version_before = _desired_full(cli)["version"]
+
+    approved = cli("plan", "approve", "--id", pid)
+    assert approved.returncode != 0
+    assert "api-model" in approved.stderr
+
+    desired_after = _desired_full(cli)
+    assert desired_after["version"] == version_before
+    assert "fleet" not in desired_after["desired"]
+    tasks = _tasks_on_board(cli)
+    assert set(tasks.keys()) == {"api-model"}  # only the pre-existing task; none of the plan's
+    assert _read_jsonl_file(cli.root / "state" / "directives.jsonl") == []
+    assert _plan_status(cli, pid) == "pending"
+
+
+# --- guards: bogus id / already-approved / already-rejected are non-zero, no effects ---
+def test_plan_approve_bogus_id_fails_no_effects(cli):
+    version_before = _desired_full(cli)["version"]
+    r = cli("plan", "approve", "--id", "does-not-exist")
+    assert r.returncode != 0
+    assert _desired_full(cli)["version"] == version_before
+
+
+def test_plan_approve_already_approved_fails_no_further_effects(cli, tmp_path):
+    doc = _valid_plan_doc()
+    pid = _propose_and_get_id(cli, doc, tmp_path)
+    first = cli("plan", "approve", "--id", pid)
+    assert first.returncode == 0, first.stdout + first.stderr
+    version_after_first = _desired_full(cli)["version"]
+
+    second = cli("plan", "approve", "--id", pid)
+    assert second.returncode != 0
+    assert _desired_full(cli)["version"] == version_after_first
+
+
+def test_plan_reject_bogus_id_fails(cli):
+    r = cli("plan", "reject", "--id", "does-not-exist")
+    assert r.returncode != 0
+
+
+def test_plan_reject_already_rejected_fails(cli, tmp_path):
+    doc = _valid_plan_doc()
+    pid = _propose_and_get_id(cli, doc, tmp_path)
+    first = cli("plan", "reject", "--id", pid)
+    assert first.returncode == 0, first.stdout + first.stderr
+    second = cli("plan", "reject", "--id", pid)
+    assert second.returncode != 0
