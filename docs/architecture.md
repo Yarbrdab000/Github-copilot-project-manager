@@ -284,3 +284,63 @@ and the worker's `continue`-driven self-loop cover the reconciliation logic comp
 piece genuinely left to the runtime is *waking a session that has gone fully idle*, which no
 in-process, offline tool can do. See [`quickstart.md`](./quickstart.md) Walkthrough D for a
 runnable trace of a failing acceptance gate driving `run` all the way to an open escalation.
+
+## 9. The cockpit seam: whole-fleet plans, human-gated
+
+§7 described a navigator proposing a single `desired.json` key. COCKPIT_SPEC extends the same
+propose → approve → propagate shape to a **whole fleet plan** — a declared set of workers with
+non-overlapping owned paths (`fleet`) plus the task DAG they'll run — and adds a single read-only
+view (`coord cockpit`) so a human (or a navigator drafting for one) can see the whole plane at a
+glance instead of stitching together `tasks`/`status`/`escalations`/`plans`.
+
+### Plans: propose → approve → spawn
+
+```mermaid
+flowchart LR
+    NAV[Navigator or human<br/>drafts a plan.json] -->|coord plan propose --file plan.json| PP[state/plans.jsonl<br/>pending — version UNCHANGED]
+    PP -->|coord plans / coord plan show| REVIEW[human reviews<br/>current -> proposed diff]
+    REVIEW -->|approve?| H{human decision}
+    H -->|coord plan approve --id pid<br/>ORCHESTRATOR ONLY| APPROVE[atomic: tasks created<br/>desired.fleet set<br/>version += 1<br/>plan -> approved]
+    H -->|coord plan reject --id pid<br/>ORCHESTRATOR ONLY| REJECT[plan -> rejected<br/>nothing else changes]
+    APPROVE -->|capped at max_concurrent| SPAWN[state/directives.jsonl<br/>initial spawn directives]
+    SPAWN -->|coord tick, every pass| TICK[spawn step: top up missing<br/>workers up to max_concurrent;<br/>over-cap -> one decision escalation]
+    TICK -->|Phase 7 runtime adapter| ADAPTER[consumes spawn directives,<br/>actually starts the worker session]
+```
+
+A plan is validated **twice**: once at `propose` (worker ids unique, `owned_paths` non-empty and
+pairwise non-overlapping — the same `_owned_paths_overlap` rule `write_scope_guard.py` already
+enforces on real writes — every task's `owned_by`/`deps` resolve, every task carries a `verify`
+key, and no task id collides with the live board), and again at `approve` (a task id may have
+landed on the board between propose and approve). If re-validation fails, `approve` makes **zero**
+changes — no partial tasks, no fleet mutation, no version bump — matching the same all-or-nothing
+shape as `state approve`'s transaction.
+
+`plan approve` is the **only** new command that bumps `desired.version` in this addendum, and it
+never touches `authorized_phase` — the phase gate stays exclusively under the human/orchestrator
+control already described in `BUILD_PLAN.md`. `plan approve`/`plan reject` are **orchestrator-only
+**: the write-scope hook denies both for every other role, including the navigator that may have
+proposed the plan in the first place (§7's same "propose ≠ approve" separation, now at fleet
+scope).
+
+### Spawn directives are advisory, same honest seam as dispatch (§8)
+
+`plan approve`'s initial batch and `tick`'s ongoing spawn step both only **append a directive** —
+`{"kind":"spawn","worker":"<id>","owned_paths":[...],"as_of":<version>,"ts":"<iso>"}` — to
+`state/directives.jsonl`, capped at `fleet.max_concurrent`. Neither `coord` command can reach out
+and actually start a session; that is the Phase 7 **runtime adapter**'s job, exactly as §8
+describes for dispatch. `tick`'s spawn step is idempotent (a worker with any spawn directive ever
+emitted counts as in-flight, so it is never re-spawned) and, when genuine demand exceeds the cap,
+opens **exactly one** deduplicated `decision` escalation rather than spamming one per over-cap
+tick or per over-cap worker.
+
+### `coord cockpit`: one read, the whole plane
+
+`coord cockpit [--json]` is a **pure read** — no writes, no heartbeat, no lock/git side effects —
+that aggregates: `desired` (version, `authorized_phase`, fleet), `tasks` (counts + ids grouped by
+status), `workers` (each declared fleet worker's liveness, heartbeat age, and held task),
+`decisions` vs. `blockers` (open escalations, kept as two distinct keys so a human can triage
+governance questions separately from stuck work), `pending` (plan and proposal ids awaiting a
+decision), and `capacity` (live workers vs. `max_concurrent`, plus any spawn directives not yet
+consumed). It exists so a navigator (or a human) can answer "what does the fleet need from me"
+without manually cross-referencing `tasks`, `status`, `escalations`, and `plans` — see
+[`quickstart.md`](./quickstart.md) Walkthrough E for a runnable propose → approve → spawn trace.

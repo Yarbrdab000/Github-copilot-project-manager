@@ -92,6 +92,48 @@ def cmd_init(a):
     print(f"initialized control plane at {root()}")
 
 
+# ---- fleet spec (COCKPIT SPEC §3.1) ---------------------------------------
+def _get_fleet(desired: dict) -> dict:
+    """Read the optional `fleet` object out of a `desired` dict (i.e. desired.json's
+    "desired" key). Absent on legacy planes -- missing must never crash a read, so this
+    normalizes to `{"max_concurrent": 0, "workers": []}` when there is no fleet declared
+    yet. Pure/read-only; does not write anything (fleet is first written by `plan
+    approve`, landing in a later phase)."""
+    fleet = desired.get("fleet") or {}
+    return {
+        "max_concurrent": fleet.get("max_concurrent", 0),
+        "workers": fleet.get("workers", []),
+    }
+
+
+def _normalize_owned_glob(glob_pat: str) -> str:
+    """Strip a trailing `/**` or `/*` so two owned-path globs can be compared as plain
+    path prefixes (COCKPIT SPEC §3.3)."""
+    for suffix in ("/**", "/*"):
+        if glob_pat.endswith(suffix):
+            return glob_pat[: -len(suffix)]
+    return glob_pat
+
+
+def _path_prefix_overlaps(a: str, b: str) -> bool:
+    """Path-segment-aware prefix check: true if one normalized path is a segment-wise
+    prefix of the other (or identical). Segment-aware so `src` does NOT match `src2` --
+    plain string prefixing would falsely overlap them."""
+    a_segs = [s for s in a.split("/") if s]
+    b_segs = [s for s in b.split("/") if s]
+    shorter, longer = (a_segs, b_segs) if len(a_segs) <= len(b_segs) else (b_segs, a_segs)
+    return shorter == longer[: len(shorter)]
+
+
+def _owned_paths_overlap(a_globs, b_globs) -> bool:
+    """True if any glob in `a_globs` overlaps any glob in `b_globs` (COCKPIT SPEC §3.3).
+    Pure/deterministic. Used to reject a fleet plan whose declared workers' owned paths
+    could collide under the write-scope hook."""
+    a_norm = [_normalize_owned_glob(g) for g in a_globs]
+    b_norm = [_normalize_owned_glob(g) for g in b_globs]
+    return any(_path_prefix_overlaps(x, y) for x in a_norm for y in b_norm)
+
+
 # ---- session lifecycle ----------------------------------------------------
 def cmd_register(a):
     reg = {
@@ -400,7 +442,7 @@ def _fold_tasks():
         t = tasks.setdefault(tid, {"id": tid, "status": "open", "deps": [], "claimed_by": None,
                                     "attempts": 0, "verified": False})
         for k in ("desc", "deps", "status", "claimed_by", "claimed_at_version",
-                  "verify", "max_attempts", "attempts", "verified"):
+                  "verify", "max_attempts", "attempts", "verified", "owned_by"):
             if k in ev and ev[k] is not None:
                 t[k] = ev[k]
     return tasks
@@ -426,6 +468,270 @@ def cmd_tasks(a):
         deps = ("deps=" + ",".join(t["deps"])) if t["deps"] else ""
         by = ("<- " + t["claimed_by"]) if t["claimed_by"] else ""
         print(f"  [{t['status']:>10}] {t['id']:<20} {by} {deps}  {t.get('desc','')}")
+
+
+# ---- plans (COCKPIT SPEC §3.2: append-only ledger + fold, like tasks) ------
+def _fold_plans():
+    """Fold the append-only plans ledger into current plan state (event sourcing,
+    same shape as `_fold_tasks`). The propose event carries `as_of`/`note`/`fleet`/
+    `tasks`; later approve/reject events only flip `status`."""
+    plans = {}
+    for ev in _read_jsonl(_p("state", "plans.jsonl")):
+        pid = ev.get("id")
+        if not pid:
+            continue
+        p = plans.setdefault(pid, {"id": pid, "status": "pending", "as_of": 0,
+                                    "note": "", "fleet": {}, "tasks": []})
+        for k in ("as_of", "note", "fleet", "tasks", "status"):
+            if k in ev and ev[k] is not None:
+                p[k] = ev[k]
+    return plans
+
+
+def _plan_validate(doc: dict, tasks_on_board: dict):
+    """Validate a proposed plan document (COCKPIT SPEC §3.2). Returns a list of error
+    strings; empty means valid. Pure — takes the current task board as a parameter so
+    it never reads disk itself (callers already have it)."""
+    errors = []
+    fleet = doc.get("fleet") or {}
+    workers = fleet.get("workers") or []
+    max_concurrent = fleet.get("max_concurrent")
+
+    if not isinstance(max_concurrent, int) or isinstance(max_concurrent, bool) or max_concurrent < 1:
+        errors.append(f"fleet.max_concurrent must be an int >= 1, got {max_concurrent!r}")
+
+    worker_ids = [w.get("id") for w in workers]
+    if len(worker_ids) != len(set(worker_ids)):
+        errors.append(f"fleet.workers ids must be unique, got {worker_ids}")
+
+    for w in workers:
+        if not w.get("owned_paths"):
+            errors.append(f"worker '{w.get('id')}' has no owned_paths")
+
+    for i in range(len(workers)):
+        for j in range(i + 1, len(workers)):
+            wa, wb = workers[i], workers[j]
+            if _owned_paths_overlap(wa.get("owned_paths") or [], wb.get("owned_paths") or []):
+                errors.append(
+                    f"workers '{wa.get('id')}' and '{wb.get('id')}' have overlapping owned_paths"
+                )
+
+    worker_id_set = set(worker_ids)
+    tasks = doc.get("tasks") or []
+    plan_task_ids = [t.get("id") for t in tasks]
+    if len(plan_task_ids) != len(set(plan_task_ids)):
+        errors.append(f"plan task ids must be unique, got {plan_task_ids}")
+    plan_task_id_set = set(plan_task_ids)
+
+    for t in tasks:
+        tid = t.get("id")
+        if tid in tasks_on_board:
+            errors.append(f"task '{tid}' already exists on the live board")
+        owned_by = t.get("owned_by")
+        if owned_by is not None and owned_by not in worker_id_set:
+            errors.append(f"task '{tid}' owned_by '{owned_by}' does not reference a declared worker")
+        for dep in t.get("deps") or []:
+            if dep not in plan_task_id_set:
+                errors.append(f"task '{tid}' dep '{dep}' does not reference a task in this plan")
+        if "verify" not in t:
+            errors.append(f"task '{tid}' is missing the 'verify' key (use null to opt out)")
+
+    return errors
+
+
+def _plan_read_doc(a) -> dict:
+    """Read the plan document from --file, or stdin when --file is absent."""
+    if getattr(a, "file", None):
+        return json.loads(Path(a.file).read_text(encoding="utf-8"))
+    return json.loads(sys.stdin.read())
+
+
+def cmd_plan(a):
+    if a.action == "propose":
+        _plan_propose(a)
+    elif a.action == "show":
+        _plan_show(a)
+    elif a.action == "approve":
+        _plan_approve(a)
+    elif a.action == "reject":
+        _plan_reject(a)
+
+
+def _plan_propose(a):
+    """Validate and write a PENDING plan to .coordination/state/plans.jsonl. Does NOT
+    bump desired.version (that happens at `plan approve`, Phase 3). Navigator-allowed."""
+    try:
+        doc = _plan_read_doc(a)
+    except (OSError, json.JSONDecodeError) as e:
+        _die(f"could not read plan document: {e}")
+        return
+
+    errors = _plan_validate(doc, _fold_tasks())
+    if errors:
+        _die("plan rejected:\n  " + "\n  ".join(errors))
+        return
+
+    st = _read_json(_p("state", "desired.json"), {"version": 0, "desired": {}})
+    current_fleet = _get_fleet(st.get("desired", {}))
+    proposed_fleet = doc.get("fleet") or {}
+    tasks = doc.get("tasks") or []
+
+    pid = str(time.time_ns())
+    ev = {
+        "ts": now(),
+        "id": pid,
+        "as_of": st.get("version", 0),
+        "note": doc.get("note", ""),
+        "fleet": proposed_fleet,
+        "tasks": tasks,
+        "status": "pending",
+    }
+    _append(_p("state", "plans.jsonl"), ev)
+    print(f"proposed plan {pid} (pending; desired.version unchanged at {st.get('version', 0)})")
+    print(f"  fleet: {json.dumps(current_fleet)} -> {json.dumps(proposed_fleet)}")
+    print(f"  tasks: 0 -> {len(tasks)}")
+    for t in tasks:
+        deps = (" deps=" + ",".join(t.get("deps") or [])) if t.get("deps") else ""
+        print(f"    + {t.get('id')} owned_by={t.get('owned_by')}{deps}")
+
+
+def cmd_plans(a):
+    """List pending plans: id, as_of, note, worker count, task count."""
+    plans = [p for p in _fold_plans().values() if p["status"] == "pending"]
+    if not plans:
+        print("(no pending plans)")
+        return
+    for p in sorted(plans, key=lambda x: x["id"]):
+        n_workers = len((p.get("fleet") or {}).get("workers") or [])
+        n_tasks = len(p.get("tasks") or [])
+        note = ("  note=" + p["note"]) if p.get("note") else ""
+        print(f"  {p['id']}  as_of={p['as_of']}  workers={n_workers}  tasks={n_tasks}{note}")
+
+
+def _plan_show(a):
+    """Print the full current -> proposed diff (fleet + task DAG) for a pending plan."""
+    if not a.id:
+        _die("`plan show` requires --id")
+    plans = _fold_plans()
+    p = plans.get(a.id)
+    if not p:
+        _die(f"no such plan '{a.id}'")
+        return
+    st = _read_json(_p("state", "desired.json"), {"version": 0, "desired": {}})
+    current_fleet = _get_fleet(st.get("desired", {}))
+    proposed_fleet = p.get("fleet") or {}
+    print(f"plan {p['id']}  status={p['status']}  as_of={p['as_of']}")
+    if p.get("note"):
+        print(f"  note: {p['note']}")
+    print(f"  fleet current:  {json.dumps(current_fleet)}")
+    print(f"  fleet proposed: {json.dumps(proposed_fleet)}")
+    print("  tasks (proposed):")
+    for t in p.get("tasks") or []:
+        deps = (" deps=" + ",".join(t.get("deps") or [])) if t.get("deps") else ""
+        print(f"    {t.get('id'):<20} owned_by={t.get('owned_by')}{deps}  {t.get('desc', '')}")
+
+
+def _plan_approve(a):
+    """Apply a pending plan ATOMICALLY (COCKPIT_SPEC.md §3.2/§3.4, keystone). Models
+    `_state_approve`'s lock/transaction shape: serialize under the `__state__` lease,
+    re-validate against the CURRENT board (a task id may have landed since propose),
+    and only then perform every effect -- create tasks, set desired.fleet, bump
+    desired.version by exactly 1, mark the plan approved, and emit the initial capped
+    `spawn` directive batch. Never touches `authorized_phase` or any other desired
+    key. Human/orchestrator-gated (the navigator is DENIED this by the hook, Phase 6)."""
+    if not a.id:
+        _die("`plan approve` requires --id")
+        return
+    for _ in range(50):
+        if _acquire_raw("__state__", a.session or "state", 30):
+            break
+        time.sleep(0.1)
+    else:
+        _die("could not acquire state lock")
+        return
+    try:
+        plan = _fold_plans().get(a.id)
+        if not plan:
+            _die(f"no such plan '{a.id}'")
+            return
+        if plan["status"] != "pending":
+            _die(f"plan '{a.id}' is '{plan['status']}' — not pending")
+            return
+        # re-validate at approve time: the board may have moved since propose.
+        errors = _plan_validate(
+            {"fleet": plan.get("fleet") or {}, "tasks": plan.get("tasks") or []}, _fold_tasks()
+        )
+        if errors:
+            _die("plan approve rejected (re-validation failed):\n  " + "\n  ".join(errors))
+            return
+
+        # from here on, every effect must land -- no more validation failures possible.
+        for t in plan.get("tasks") or []:
+            ev = {
+                "ts": now(),
+                "id": t.get("id"),
+                "desc": t.get("desc", ""),
+                "deps": t.get("deps") or [],
+                "status": "open",
+                "claimed_by": None,
+            }
+            if t.get("owned_by") is not None:
+                ev["owned_by"] = t["owned_by"]
+            if t.get("verify") is not None:
+                ev["verify"] = t["verify"]
+            if t.get("max_attempts") is not None:
+                ev["max_attempts"] = t["max_attempts"]
+            _append(_p("board", "tasks.jsonl"), ev)
+
+        path = _p("state", "desired.json")
+        st = _read_json(path, {"version": 0, "desired": {}})
+        st.setdefault("desired", {})["fleet"] = plan.get("fleet") or {}
+        st["version"] = st.get("version", 0) + 1
+        st["updated"] = iso()
+        new_version = st["version"]
+        _atomic_write(path, json.dumps(st, indent=2))
+        _append(_p("board", "events.jsonl"),
+                {"ts": now(), "event": "plan_approved", "pid": a.id, "version": new_version})
+
+        _append(_p("state", "plans.jsonl"), {"ts": now(), "id": a.id, "status": "approved"})
+
+        fleet = plan.get("fleet") or {}
+        workers = fleet.get("workers") or []
+        max_concurrent = fleet.get("max_concurrent", 0)
+        spawned = []
+        for w in workers[:max_concurrent]:
+            _append(_p("state", "directives.jsonl"), {
+                "kind": "spawn",
+                "worker": w.get("id"),
+                "owned_paths": w.get("owned_paths") or [],
+                "as_of": new_version,
+                "ts": iso(),
+            })
+            spawned.append(w.get("id"))
+
+        print(f"approved {a.id}: {len(plan.get('tasks') or [])} tasks created; "
+              f"desired.fleet set; state version -> {new_version}")
+        if spawned:
+            print(f"  spawn directives: {spawned}")
+    finally:
+        _release_raw("__state__", a.session or "state")
+
+
+def _plan_reject(a):
+    """Mark a pending plan rejected. No version bump, no fleet change, no tasks, no
+    directives -- rejection is a pure no-op besides the ledger entry."""
+    if not a.id:
+        _die("`plan reject` requires --id")
+        return
+    plan = _fold_plans().get(a.id)
+    if not plan:
+        _die(f"no such plan '{a.id}'")
+        return
+    if plan["status"] != "pending":
+        _die(f"plan '{a.id}' is '{plan['status']}' — not pending")
+        return
+    _append(_p("state", "plans.jsonl"), {"ts": now(), "id": a.id, "status": "rejected"})
+    print(f"rejected plan {a.id} (version unchanged)")
 
 
 def cmd_claim(a):
@@ -680,6 +986,110 @@ def cmd_status(a):
     cmd_tasks(a)
 
 
+# ---- cockpit (COCKPIT SPEC §3.6: single read-only aggregate view) ----------
+def _build_cockpit_view() -> dict:
+    """Read-only aggregate of the whole cockpit plane. Pure read: no writes, no
+    heartbeat/lock side effects -- safe to call anytime. Reuses the existing fold/
+    read helpers (`_get_fleet`, `_fold_tasks`, `_heartbeat_stale`, `_read_escalations`,
+    `_fold_plans`, the proposals reader, the directives ledger) rather than
+    reimplementing any state derivation."""
+    st = _read_json(_p("state", "desired.json"), {"version": 0, "desired": {}})
+    desired = st.get("desired", {})
+    fleet = _get_fleet(desired)
+    declared_workers = fleet.get("workers") or []
+    max_concurrent = fleet.get("max_concurrent", 0)
+
+    tasks = _fold_tasks()
+    by_status = {"open": [], "claimed": [], "done": [], "failed": []}
+    counts = {}
+    for t in tasks.values():
+        status = t.get("status", "open")
+        counts[status] = counts.get(status, 0) + 1
+        by_status.setdefault(status, []).append(t["id"])
+
+    live_ids = set()
+    workers_view = []
+    for w in declared_workers:
+        wid = w.get("id")
+        reg = _read_json(_p("registry", f"{wid}.json"), {})
+        stale = _heartbeat_stale(wid)
+        age = (now() - reg.get("heartbeat", 0)) if reg else None
+        if not stale:
+            live_ids.add(wid)
+        holds = next((t["id"] for t in tasks.values()
+                      if t.get("status") == "claimed" and t.get("claimed_by") == wid), None)
+        workers_view.append({
+            "id": wid,
+            "liveness": "stale" if stale else "fresh",
+            "heartbeat_age_sec": (int(age) if age is not None else None),
+            "task": holds,
+        })
+
+    escalations = _read_escalations()
+    decisions = [e for e in escalations if e.get("kind") == "decision" and e.get("status") == "open"]
+    blockers = [e for e in escalations if e.get("kind") == "blocker" and e.get("status") == "open"]
+
+    pending_plans = sorted(p["id"] for p in _fold_plans().values() if p.get("status") == "pending")
+    pending_proposals = sorted(
+        prop.get("pid") for pf in _p("state", "proposals").glob("*.json")
+        for prop in [_read_json(pf, {})] if prop.get("status") == "pending"
+    )
+
+    # no consumer exists yet (Phase 7), so every spawn directive ever emitted for a
+    # worker is "unconsumed" -- same idempotency notion used by tick's spawn step.
+    spawn_workers = sorted({d.get("worker") for d in _read_jsonl(_p("state", "directives.jsonl"))
+                            if d.get("kind") == "spawn"})
+
+    return {
+        "desired": {
+            "version": st.get("version", 0),
+            "authorized_phase": desired.get("authorized_phase"),
+            "fleet": {
+                "max_concurrent": max_concurrent,
+                "workers": [w.get("id") for w in declared_workers],
+            },
+        },
+        "tasks": {
+            "counts": counts,
+            "by_status": by_status,
+        },
+        "workers": workers_view,
+        "decisions": decisions,
+        "blockers": blockers,
+        "pending": {
+            "plans": pending_plans,
+            "proposals": pending_proposals,
+        },
+        "capacity": {
+            "live": len(live_ids),
+            "max_concurrent": max_concurrent,
+            "unconsumed_spawn_directives": len(spawn_workers),
+            "unconsumed_spawn_workers": spawn_workers,
+        },
+    }
+
+
+def cmd_cockpit(a):
+    view = _build_cockpit_view()
+    if getattr(a, "json", False):
+        print(json.dumps(view, indent=2))
+        return
+    d = view["desired"]
+    print(f"desired: version={d['version']} authorized_phase={d['authorized_phase']} "
+          f"fleet(max_concurrent={d['fleet']['max_concurrent']}, workers={d['fleet']['workers']})")
+    print("tasks:")
+    for status, ids in view["tasks"]["by_status"].items():
+        print(f"  {status:<8} {len(ids):>3}  {ids}")
+    print("workers:")
+    for w in view["workers"]:
+        print(f"  {w['id']:<12} {w['liveness']:<6} age={w['heartbeat_age_sec']}s task={w['task']}")
+    print(f"decisions: {len(view['decisions'])}  blockers: {len(view['blockers'])}")
+    print(f"pending: plans={view['pending']['plans']} proposals={view['pending']['proposals']}")
+    c = view["capacity"]
+    print(f"capacity: live={c['live']}/{c['max_concurrent']}  "
+          f"unconsumed_spawn={c['unconsumed_spawn_directives']} {c['unconsumed_spawn_workers']}")
+
+
 def _reap_once():
     """Release locks held by dead sessions and requeue their in-progress tasks.
     Returns (reaped_locks, requeued) — lists of (name, holder) tuples — without printing,
@@ -726,11 +1136,12 @@ def _send_message(sender: str, to: str, body: str, as_of: int | None, ttl: int |
 def _tick_once() -> dict:
     """Perform ONE deterministic reconciliation pass and return the effects report.
 
-    HARD INVARIANT (AUTONOMY_SPEC §3.3): this never changes `authorized_phase`,
-    never approves/rejects a proposal, and never performs a git write. It only reads
-    desired-state and reconciles WITHIN the current human authorization — dispatch and
-    stall-nudge steps are advisory (they queue messages; delivery/waking a session is a
-    runtime adapter's job, not this command's).
+    HARD INVARIANT (AUTONOMY_SPEC §3.3, extended by COCKPIT_SPEC §3.5 to the spawn
+    step): this never changes `authorized_phase` or `desired.version`, never
+    approves/rejects a plan or proposal, and never performs a git write. It only reads
+    desired-state and reconciles WITHIN the current human authorization — dispatch,
+    stall-nudge, and spawn are all advisory (they queue messages/directives; actually
+    spawning or waking a session is a runtime adapter's job, not this command's).
 
     Shared by `cmd_tick` (single pass, prints once) and `cmd_run` (the thin loop
     wrapper, which calls this repeatedly) so both go through the identical code path.
@@ -782,12 +1193,64 @@ def _tick_once() -> dict:
     tasks = _fold_tasks()
     registries = {rp.stem: _read_json(rp, {}) for rp in _p("registry").glob("*.json")}
 
+    # 3. spawn (COCKPIT_SPEC §3.5): ensure declared-but-not-live fleet workers that own
+    # needed work get a `spawn` directive, capped at `max_concurrent`. Purely advisory --
+    # `coord` never spawns/wakes a session itself; a runtime adapter (Phase 7) consumes
+    # the directives ledger and calls the host's real spawn capability. Runs BEFORE
+    # dispatch so a freshly-declared worker can be seen as a dispatch candidate once the
+    # adapter has actually spawned it (a later tick, once it registers and heartbeats).
+    spawned = []
+    fleet = _get_fleet(desired)
+    declared_workers = fleet.get("workers") or []
+    max_concurrent = fleet.get("max_concurrent", 0)
+    if declared_workers:
+        live_ids = {w["id"] for w in declared_workers if not _heartbeat_stale(w.get("id"))}
+        # a task with owned_by: null owns no worker and never makes anyone "missing".
+        needed_ids = {t.get("owned_by") for t in tasks.values()
+                      if t.get("owned_by") and t["status"] in ("open", "claimed")}
+        missing_workers = [w for w in declared_workers
+                            if w.get("id") in needed_ids and w.get("id") not in live_ids]
+        # idempotency: a missing worker with an already-queued (unconsumed -- there is no
+        # consumer yet) spawn directive counts toward the cap but is NOT re-emitted.
+        existing_spawn_ids = {d.get("worker") for d in _read_jsonl(_p("state", "directives.jsonl"))
+                               if d.get("kind") == "spawn"}
+        new_candidates = [w for w in missing_workers if w.get("id") not in existing_spawn_ids]
+
+        # Every worker already live OR already holding an unconsumed spawn directive occupies
+        # a real concurrency slot -- including a declared worker that owns no task, whose
+        # directive `plan approve` emits positionally (workers[:max_concurrent]) and which
+        # therefore never appears in `missing_workers`. Count the union of both so that slot is
+        # never invisible to the cap; otherwise tick can spawn one worker too many and the live
+        # fleet breaches the declared hard cap (COCKPIT_SPEC.md §3.1).
+        capacity_used = len(live_ids | existing_spawn_ids)
+        capacity_remaining = max(max_concurrent - capacity_used, 0)
+        to_spawn, over_cap = new_candidates[:capacity_remaining], new_candidates[capacity_remaining:]
+
+        for w in to_spawn:
+            _append(_p("state", "directives.jsonl"), {
+                "kind": "spawn",
+                "worker": w.get("id"),
+                "owned_paths": w.get("owned_paths") or [],
+                "as_of": version,
+                "ts": iso(),
+            })
+            spawned.append(w.get("id"))
+
+        if over_cap:
+            _CAP_DECISION = "fleet at cap; raise max_concurrent or wait"
+            already_open = any(
+                e.get("kind") == "decision" and e.get("status") == "open" and e.get("body") == _CAP_DECISION
+                for e in _read_escalations()
+            )
+            if not already_open:
+                _open_escalation("tick", "decision", _CAP_DECISION)
+
     def _is_idle(session: str) -> bool:
         if _heartbeat_stale(session):
             return False
         return not any(tt["status"] == "claimed" and tt["claimed_by"] == session for tt in tasks.values())
 
-    # 3. dispatch (advisory): ready, unclaimed tasks -> message an idle worker to claim.
+    # 4. dispatch (advisory): ready, unclaimed tasks -> message an idle worker to claim.
     # Tasks don't currently carry their own path set, so "owned_paths match the task" is
     # applied at the granularity we have: any idle, live, registered worker is a candidate.
     max_parallel = desired.get("max_parallel")
@@ -816,7 +1279,7 @@ def _tick_once() -> dict:
         dispatched.append({"task": t["id"], "to": worker})
         claimed_count += 1  # advisory: reserve capacity against max_parallel for this pass
 
-    # 4. stall nudge (advisory): claimed task whose heartbeat is aging but not yet reap-stale.
+    # 5. stall nudge (advisory): claimed task whose heartbeat is aging but not yet reap-stale.
     for t in tasks.values():
         if t["status"] != "claimed":
             continue
@@ -829,7 +1292,7 @@ def _tick_once() -> dict:
             _send_message("tick", claimant, f"task '{t['id']}' claimed but heartbeat is aging; continue", as_of=version)
             nudged.append(t["id"])
 
-    # 5. budgets: a global time-budget breach stops the fleet (never touches authorized_phase).
+    # 6. budgets: a global time-budget breach stops the fleet (never touches authorized_phase).
     time_budget = desired.get("time_budget_sec")
     if time_budget is not None:
         oldest_registered = None
@@ -842,13 +1305,14 @@ def _tick_once() -> dict:
             if (now() - started) > time_budget:
                 cmd_stop(argparse.Namespace(session=None))
 
-    # 6. surface open escalations for the human/navigator to act on.
+    # 7. surface open escalations for the human/navigator to act on.
     awaiting_decision = [e for e in _read_escalations() if e.get("status") == "open"]
 
     return {
         "reaped": reaped,
         "verified": verified,
         "requeued": requeued,
+        "spawned": spawned,
         "dispatched": dispatched,
         "nudged": nudged,
         "failed": failed,
@@ -913,6 +1377,14 @@ def build_parser():
 
     sub.add_parser("tasks").set_defaults(func=cmd_tasks)
 
+    pl = sub.add_parser("plan"); pl.set_defaults(func=cmd_plan)
+    pl.add_argument("action", choices=["propose", "show", "approve", "reject"])
+    pl.add_argument("--file", help="path to a plan JSON document (default: read from stdin)")
+    pl.add_argument("--id", help="plan id (pid) for `plan show`/`plan approve`/`plan reject`")
+    pl.add_argument("--session", help="session id used as the state-lock holder for `plan approve`")
+
+    sub.add_parser("plans").set_defaults(func=cmd_plans)
+
     vf = sub.add_parser("verify"); vf.set_defaults(func=cmd_verify)
     vf.add_argument("--task", required=True); vf.add_argument("--json", action="store_true")
 
@@ -957,6 +1429,9 @@ def build_parser():
     rn.add_argument("--interval", type=float, default=5.0, help="seconds to sleep between tick passes")
     rn.add_argument("--max-ticks", dest="max_ticks", type=int, default=None, help="stop after this many passes (default: unbounded)")
     rn.add_argument("--once", action="store_true", help="equivalent to --max-ticks 1")
+
+    ck = sub.add_parser("cockpit"); ck.set_defaults(func=cmd_cockpit)
+    ck.add_argument("--json", action="store_true", help="print the aggregate as JSON")
     return p
 
 

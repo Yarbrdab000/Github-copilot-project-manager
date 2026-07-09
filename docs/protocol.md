@@ -209,6 +209,79 @@ hook denies `add-task ... --verify` for any other role, so a gate always comes f
 human-approved plan, never from the code being verified (see
 [`hooks/README.md`](../hooks/README.md)).
 
+### `coord plan propose --file PLAN.json` (or pipe the plan document on stdin)
+Validate and write a **pending** whole-fleet plan to `state/plans.jsonl` (COCKPIT_SPEC §3.2) — a
+navigator (or a human) drafts a `fleet` (worker ids + non-overlapping `owned_paths` +
+`max_concurrent`) and a task DAG (`id`/`deps`/`owned_by`/`verify`), and this is the request, not
+the act. Validation (worker ids unique, `owned_paths` non-empty and pairwise non-overlapping —
+reusing the same `_owned_paths_overlap` rule the write-scope hook enforces on real writes, every
+`task.owned_by`/`deps` resolves, every task carries a `verify` key, no task id collides with the
+live board) all runs before anything is written; any failure exits non-zero with **nothing**
+written. **Does not bump `desired.version`.**
+
+```
+$ coord plan propose --session nav --file plan1.json
+proposed plan 1783555685181644600 (pending; desired.version unchanged at 0)
+  fleet: {"max_concurrent": 0, "workers": []} -> {"max_concurrent": 2, "workers": [{"id": "w1", "owned_paths": ["src/w1/**"]}, {"id": "w2", "owned_paths": ["src/w2/**"]}]}
+  tasks: 0 -> 2
+    + build-a owned_by=w1
+    + build-b owned_by=w2
+```
+
+### `coord plans`
+List every **pending** plan: id, `as_of`, note, worker count, task count.
+
+```
+$ coord plans
+1783555685181644600  as_of=0  workers=2  tasks=2  note=stand up the fleet
+```
+
+### `coord plan show --id PID`
+Print the full `current -> proposed` diff for a pending plan: the fleet (current vs. proposed)
+and the proposed task DAG.
+
+```
+$ coord plan show --id 1783555685181644600
+plan 1783555685181644600  status=pending  as_of=0
+  note: stand up the fleet
+  fleet current:  {"max_concurrent": 0, "workers": []}
+  fleet proposed: {"max_concurrent": 2, "workers": [{"id": "w1", "owned_paths": ["src/w1/**"]}, {"id": "w2", "owned_paths": ["src/w2/**"]}]}
+  tasks (proposed):
+    build-a              owned_by=w1  build A
+    build-b              owned_by=w2  build B
+```
+
+### `coord plan approve --id PID [--session ID]`
+Apply a pending plan — the human-gated seam where a proposal becomes real fleet + tasks
+(COCKPIT_SPEC §3.2/§3.4). Under the same `__state__` lock `state approve` uses: re-validates the
+plan against the **current** board (a task id may have landed since propose), then, only if that
+still passes, atomically creates every plan task (carrying `owned_by`/`deps`/`verify`/
+`max_attempts`, status `open`), sets `desired.fleet`, **bumps `desired.version` by exactly 1**
+(never `authorized_phase`), marks the plan `approved`, and emits the initial `spawn` directives
+capped at `fleet.max_concurrent`. Any validation failure at this point aborts with **zero**
+effects — no partial tasks, no fleet change, no version bump. Fails (exit 1) if the plan doesn't
+exist or isn't `pending`.
+
+```
+$ coord plan approve --session orch --id 1783555685181644600
+approved 1783555685181644600: 2 tasks created; desired.fleet set; state version -> 1
+  spawn directives: ['w1', 'w2']
+```
+
+The write-scope hook denies `coord plan approve` for every non-`orchestrator` role — including a
+navigator that drafted the plan — the same "propose ≠ approve" separation `state approve` already
+enforces, now at fleet scope.
+
+### `coord plan reject --id PID [--session ID]`
+Mark a pending plan `rejected`. **No version bump, no fleet change, no tasks, no directives** —
+same non-`orchestrator` hook denial as `plan approve`. Fails (exit 1) if the plan doesn't exist or
+isn't `pending`.
+
+```
+$ coord plan reject --session orch --id 1783555696942419100
+rejected plan 1783555696942419100 (version unchanged)
+```
+
 ### `coord tasks`
 List the current state of every task (the fold of the ledger).
 
@@ -386,10 +459,12 @@ $ coord escalations
 ### `coord tick [--json]`
 **The keystone reconciliation pass** (AUTONOMY_SPEC §3.3): one deterministic sweep that reaps
 dead sessions, runs coded acceptance gates on `done` tasks, requeues-or-escalates on repeated
-verify failure, advisory-dispatches ready work to idle workers, advisory-nudges a claimant whose
+verify failure, **spawns declared-but-missing fleet workers up to `max_concurrent`** (COCKPIT_SPEC
+§3.5 — idempotent across ticks, and deduped to exactly one `decision` escalation when demand
+exceeds the cap), advisory-dispatches ready work to idle workers, advisory-nudges a claimant whose
 heartbeat is aging, enforces budgets, and surfaces open escalations. Always prints JSON and
-exits `0`. See [`architecture.md`](./architecture.md) §8 for the full step order and the hard
-invariant it upholds (never touches `authorized_phase`, never approves/rejects a proposal,
+exits `0`. See [`architecture.md`](./architecture.md) §8–9 for the full step order and the hard
+invariant it upholds (never touches `authorized_phase`, never approves/rejects a proposal/plan,
 never performs a git operation).
 
 ```
@@ -398,6 +473,7 @@ $ coord tick
   "reaped": [],
   "verified": [],
   "requeued": [],
+  "spawned": [],
   "dispatched": [],
   "nudged": [],
   "failed": [
@@ -418,7 +494,63 @@ as `coord tick`.
 
 ```
 $ coord run --once --interval 0
-{ "reaped": [], "verified": [], "requeued": [], "dispatched": [], "nudged": [], "failed": [], "awaiting_decision": [] }
+{ "reaped": [], "verified": [], "requeued": [], "spawned": [], "dispatched": [], "nudged": [], "failed": [], "awaiting_decision": [] }
+```
+
+### `coord cockpit [--json]`
+A single **pure-read** aggregate of the whole plane (COCKPIT_SPEC §3.6) — no writes, no
+heartbeat, no lock/git side effects. Reuses the existing fold/read helpers only: `desired`
+(version, `authorized_phase`, fleet), `tasks` (counts + ids grouped by status), `workers` (each
+declared fleet worker's liveness, heartbeat age, and held task), `decisions` vs. `blockers` (open
+escalations, kept as two separate keys), `pending` (plan and proposal ids awaiting a human
+decision), and `capacity` (live workers vs. `max_concurrent`, plus any spawn directives not yet
+consumed). Exists so a navigator or human can see "what does the fleet need from me" in one call
+instead of cross-referencing `tasks`/`status`/`escalations`/`plans` separately.
+
+```
+$ coord cockpit --json
+{
+  "desired": {
+    "version": 1,
+    "authorized_phase": null,
+    "fleet": { "max_concurrent": 2, "workers": ["w1", "w2"] }
+  },
+  "tasks": {
+    "counts": { "open": 2 },
+    "by_status": { "open": ["build-a", "build-b"], "claimed": [], "done": [], "failed": [] }
+  },
+  "workers": [
+    { "id": "w1", "liveness": "stale", "heartbeat_age_sec": null, "task": null },
+    { "id": "w2", "liveness": "stale", "heartbeat_age_sec": null, "task": null }
+  ],
+  "decisions": [],
+  "blockers": [],
+  "pending": { "plans": [], "proposals": [] },
+  "capacity": {
+    "live": 0,
+    "max_concurrent": 2,
+    "unconsumed_spawn_directives": 2,
+    "unconsumed_spawn_workers": ["w1", "w2"]
+  }
+}
+```
+
+Without `--json`, `coord cockpit` prints the same data as compact human-readable text:
+
+```
+$ coord cockpit
+desired: version=1 authorized_phase=None fleet(max_concurrent=2, workers=['w1', 'w2'])
+tasks:
+  open       2  ['build-a', 'build-b']
+  claimed    0  []
+  done       0  []
+  failed     0  []
+workers:
+  w1           stale  age=Nones task=None
+  w2           stale  age=Nones task=None
+decisions: 0  blockers: 0
+pending: plans=[] proposals=[]
+capacity: live=0/2  unconsumed_spawn=2 ['w1', 'w2']
 ```
 
 ---

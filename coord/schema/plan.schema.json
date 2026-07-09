@@ -1,0 +1,102 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "urn:agent-coordination-skills:plan-event",
+  "title": "Coord plan-ledger event",
+  "description": "One append-only line in state/plans.jsonl. Plan state is event-sourced: the current state of a plan id is the fold of all of its events (see _fold_plans). `as_of`/`note`/`fleet`/`tasks` appear on the propose event; approve/reject events only flip `status` (see COCKPIT_SPEC.md §3.2).",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "ts",
+    "id",
+    "status"
+  ],
+  "properties": {
+    "ts": {
+      "type": "number",
+      "description": "Epoch seconds when this event was appended."
+    },
+    "id": {
+      "type": "string",
+      "description": "Plan id this event applies to (epoch-ns of the propose event)."
+    },
+    "as_of": {
+      "type": "integer",
+      "minimum": 0,
+      "description": "desired-state version at the moment of proposal (present on the propose event)."
+    },
+    "note": {
+      "type": "string",
+      "description": "Free-text note describing the plan's goal (present on the propose event)."
+    },
+    "fleet": {
+      "type": "object",
+      "description": "The proposed fleet spec (present on the propose event).",
+      "properties": {
+        "max_concurrent": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "workers": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "properties": {
+              "id": {
+                "type": "string"
+              },
+              "owned_paths": {
+                "type": "array",
+                "items": {
+                  "type": "string"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "tasks": {
+      "type": "array",
+      "description": "The proposed task DAG (present on the propose event).",
+      "items": {
+        "type": "object",
+        "properties": {
+          "id": {
+            "type": "string"
+          },
+          "desc": {
+            "type": "string"
+          },
+          "owned_by": {
+            "type": "string"
+          },
+          "deps": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          },
+          "verify": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "max_attempts": {
+            "type": "integer",
+            "minimum": 0
+          }
+        }
+      }
+    },
+    "status": {
+      "type": "string",
+      "enum": [
+        "pending",
+        "approved",
+        "rejected"
+      ],
+      "description": "Plan status after applying this event."
+    }
+  }
+}

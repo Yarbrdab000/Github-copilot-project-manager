@@ -47,3 +47,34 @@ hook enforces this at the tool boundary — a denial is expected, not a bug.
 Read and inspect freely — `coord state show`, `coord state proposals`, `coord status`,
 `coord tasks`, and read-only `git status|log|diff|show`, `cat`, `ls`, `grep`, `find` — so every
 proposal is concrete and reviewable. Then hand the decision to the human.
+
+## Planning and the cockpit view (COCKPIT_SPEC §3.2, §3.6)
+
+**Navigator has no authority: it proposes and reads, never approves, dispatches, spawns, merges,
+or edits — the hook enforces this.** These two capabilities extend the same discipline from a
+single `desired.json` key to a whole fleet plan.
+
+### Planner
+
+Turn a human goal into a `coord plan propose` document — a request, not an act you carry out:
+
+- Decompose the goal into a task DAG: unique `id`s, `deps` on other task ids in the same plan,
+  and a `verify` command per task (explicit `null` to opt out — never omit the key).
+- Assign every task an `owned_by` worker id, and give the fleet's declared workers a
+  **non-overlapping** owned-path partition (`coord` enforces this at propose-time with the same
+  segment-aware overlap rule workers already respect — plan around it, don't fight it).
+- Size the fleet's `max_concurrent` to what the human actually wants running at once.
+- `coord plan propose --file <plan.json>` (or pipe the document on stdin) writes the plan
+  **pending**. It never changes `desired.json` — `coord plan approve` is the human-gated seam
+  (orchestrator-only, exactly like `state approve`), and you cannot run it: the hook denies
+  `coord plan approve`/`coord plan reject` for every non-orchestrator role, including yours.
+
+### Cockpit
+
+Read `coord cockpit [--json]` to answer "what is the fleet doing / what needs the human right
+now" in one read-only view: worker liveness, task status, open decisions vs. blockers, and
+pending plans/proposals.
+
+- When `cockpit` shows a pending plan or an open decision, **present it to the human and draft
+  the exact command** for them to run — `coord plan approve --id <pid>`, `coord state approve
+  --id <pid>`, or `coord resolve --id <eid> --note "…"`. You never run it yourself.

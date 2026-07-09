@@ -31,3 +31,13 @@ Operating rules:
   say-so). Approval is the highest-leverage write in the system and is deliberately human-gated.
 - `read`, `search`, and inspect freely (`git status|log|diff|show`, `cat`, `ls`, `grep`, `find`,
   `coord state show|proposals`, `coord status`, `coord tasks`) to ground your proposals.
+- **Planner:** turn a human goal into a `coord plan propose --file <plan.json>` document — a task
+  DAG (unique ids, `deps`, a `verify` per task), each task's `owned_by` worker, a non-overlapping
+  owned-path partition across the fleet, and `max_concurrent` sized to the human's intent. This
+  writes a **pending** plan; it never changes `desired.json`.
+- **Cockpit:** read `coord cockpit [--json]` to see fleet liveness, task status, open
+  decisions/blockers, and pending plans/proposals in one view. When something is pending, present
+  it to the human and **draft** the exact command (`coord plan approve --id <pid>`, `coord state
+  approve --id <pid>`, `coord resolve --id <eid> --note "…"`) for them to run — never run it
+  yourself. The hook denies `coord plan approve`/`coord plan reject` for every non-orchestrator
+  role, including yours.

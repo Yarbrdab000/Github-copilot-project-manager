@@ -14,15 +14,18 @@ with the ``COORD_SESSION`` env var), then:
     branch, and redirects to absolute paths outside the worktree. Also denies a non-
     ``orchestrator`` role running ``coord add-task ... --verify ...`` (AUTONOMY_SPEC §4:
     acceptance gates must originate from the human-approved plan, never be self-injected
-    by the code under verification) — covers the alias and spelled-out invocation, and any
-    segment of a compound (``&&``/``;``/``|``) command. Otherwise allow.
+    by the code under verification), and a non-``orchestrator`` role running ``coord plan
+    approve``/``coord plan reject`` (COCKPIT_SPEC §3.2/§3.4: a proposed plan becoming real
+    fleet+tasks is the human-gated seam) — covers the alias and spelled-out invocation, and
+    any segment of a compound (``&&``/``;``/``|``) command. Otherwise allow.
   * read tools (grep/glob/view/...): always **allow**.
 
-A ``navigator``-role session is special (NAVIGATOR_SPEC §4): all file-editing
-tools are denied outright, and ``bash`` is restricted to an allow-list — ``coord
-state propose/proposals/show``, ``coord status``, ``coord tasks``, and read-only
-inspection (``git status|log|diff|show``, ``cat``, ``ls``, ``grep``, ``find``) —
-with everything else (incl. any output redirection) denied.
+A ``navigator``-role session is special (NAVIGATOR_SPEC §4, extended by COCKPIT_SPEC §3.2):
+all file-editing tools are denied outright, and ``bash`` is restricted to an allow-list —
+``coord state propose/proposals/show``, ``coord plan propose/show``, ``coord plans``,
+``coord cockpit``, ``coord status``, ``coord tasks``, and read-only inspection (``git
+status|log|diff|show``, ``cat``, ``ls``, ``grep``, ``find``) — with everything else
+(incl. ``coord plan approve``/``coord plan reject`` and any output redirection) denied.
 
 Emits ``{"permissionDecision":"allow"}`` or
 ``{"permissionDecision":"deny","permissionDecisionReason":"..."}`` on stdout and exits 0.
@@ -155,6 +158,9 @@ def _check_bash(command: str, session_branch: str, worktree: str, role: str = ""
             if _segment_has_add_task_verify(seg):
                 return "deny", ("only the orchestrator may attach a --verify acceptance gate; "
                                  "it must come from the approved plan")
+            if _segment_has_plan_approve_or_reject(seg):
+                return "deny", ("only the orchestrator may run 'coord plan approve'/'coord plan reject'; "
+                                 "the human-gated plan approval is inviolate")
     if re.search(r"\bgit\s+push\b", command):
         return "deny", "git push is not permitted from a coordinated worker session"
     m = re.search(r"\bgit\s+(checkout|switch)\b(.*)", command)
@@ -188,7 +194,8 @@ def _check_bash(command: str, session_branch: str, worktree: str, role: str = ""
 # may only propose desired-state changes and read. Its bash is an ALLOW-LIST
 # (deny by default); all file-editing tools are denied outright.
 NAV_COORD_STATE_ALLOWED = {"propose", "proposals", "show"}
-NAV_COORD_TOP_ALLOWED = {"status", "tasks"}
+NAV_COORD_PLAN_ALLOWED = {"propose", "show"}
+NAV_COORD_TOP_ALLOWED = {"status", "tasks", "plans", "cockpit"}
 NAV_READONLY_CMDS = {"cat", "ls", "grep", "find"}
 NAV_GIT_READONLY = {"status", "log", "diff", "show"}
 # shell separators that chain multiple commands; split so ANY denied segment denies
@@ -222,6 +229,18 @@ def _segment_has_add_task_verify(seg: str) -> bool:
     return any(t == "--verify" or t.startswith("--verify=") for t in tokens[2:])
 
 
+def _segment_has_plan_approve_or_reject(seg: str) -> bool:
+    """True if this segment invokes `coord plan approve` or `coord plan reject` (alias
+    or spelled-out). COCKPIT_SPEC §3.2/§3.4: a proposed plan becoming real fleet+tasks
+    is the human-gated seam -- only the orchestrator role may run it."""
+    stripped = _strip_quoted(seg)
+    norm = _normalize_coord(stripped)
+    tokens = norm.split()
+    if len(tokens) < 3 or tokens[0] != "coord" or tokens[1] != "plan":
+        return False
+    return tokens[2] in ("approve", "reject")
+
+
 def _nav_segment_allowed(seg: str) -> bool:
     seg = seg.strip()
     if not seg:
@@ -238,7 +257,9 @@ def _nav_segment_allowed(seg: str) -> bool:
             return True
         if len(tokens) >= 3 and tokens[1] == "state" and tokens[2] in NAV_COORD_STATE_ALLOWED:
             return True
-        return False  # coord state set/approve/reject, claim, complete, add-task, lock, send, stop, ...
+        if len(tokens) >= 3 and tokens[1] == "plan" and tokens[2] in NAV_COORD_PLAN_ALLOWED:
+            return True
+        return False  # coord state set/approve/reject, plan approve/reject, claim, complete, add-task, lock, send, stop, ...
     if head == "git":
         return len(tokens) >= 2 and tokens[1] in NAV_GIT_READONLY  # push/merge/checkout/switch/commit denied
     if head in NAV_READONLY_CMDS:
@@ -253,6 +274,7 @@ def _check_navigator_bash(command: str):
         if not _nav_segment_allowed(seg):
             return "deny", (
                 "navigator role may only run 'coord state propose/proposals/show', "
+                "'coord plan propose/show', 'coord plans', 'coord cockpit', "
                 "'coord status', 'coord tasks', and read-only inspection "
                 "(git status|log|diff|show, cat, ls, grep, find) — denied: " + seg.strip()
             )

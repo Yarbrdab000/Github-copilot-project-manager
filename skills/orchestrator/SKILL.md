@@ -45,3 +45,18 @@ At each of your checkpoints (follow the ritual in `coordination-protocol`):
 - Hold the exit criteria: only wind down once the desired state is satisfied.
 - Stop the fleet cleanly: `coord stop` (global) or `coord stop --session <id>` (one worker);
   undo with `coord resume`.
+
+## Applying human-approved plans (COCKPIT_SPEC §3.2, §3.4)
+
+A navigator may propose a whole-fleet plan (`coord plan propose`), but only you — on explicit
+human approval — apply it: `coord plan approve --id <pid>` atomically creates every plan task,
+sets `desired.fleet`, bumps `desired.version` by exactly 1, and emits the initial `spawn`
+directives capped at `max_concurrent`. `coord plan reject --id <pid>` leaves everything
+unchanged. This is the same human gate as `state approve` — the hook denies both `plan
+approve`/`reject` for every non-orchestrator role.
+
+`coord` itself never spawns or wakes a worker session — a `spawn`/`dispatch` directive in
+`.coordination/state/directives.jsonl` is advisory. A separate **runtime adapter** is the honest
+filesystem→runtime seam: it consumes those directives and calls the host's actual spawn
+capability (e.g. this app's `create_session`/`send_session_message`). Keep that boundary —
+`coord`'s job is to decide and record, not to act on the outside world.
