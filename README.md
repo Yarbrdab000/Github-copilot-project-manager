@@ -89,9 +89,10 @@ end-to-end scenario see [`examples/research-and-migrate/`](examples/research-and
 
 ```
 coord/          # the coord CLI + JSON Schemas for its records
-skills/         # protocol + role skills every agent loads
+skills/         # protocol + role skills every agent loads (incl. navigator, self-update)
 agents/         # scoped custom-agent definitions (orchestrator, researcher, editor)
 hooks/          # write-scope guard + session-register scripts
+scripts/        # offline maintenance helpers (self_update.py)
 .github/hooks/  # hook wiring (coordination.json)
 docs/           # architecture, full protocol reference, quickstart
 examples/       # a worked research-and-migrate scenario
@@ -107,6 +108,22 @@ python -m pytest -q
 The suite exercises the control plane (dependency blocking, atomic claim, lease deny→steal→reap,
 staleness filtering, stop-flag halt) and the write-scope hook (in-scope allow, out-of-scope and
 traversal deny), plus JSON-Schema validation of the record formats.
+
+## Keeping the install up to date
+
+Once installed as a plugin, you can update it to the latest `main` from inside a Copilot
+session: just say **"update to latest version"** (or "self-update"). The `self-update` skill
+fetches `main`, previews the change with a dry-run, asks you to confirm, then mirrors it over
+your install.
+
+All destructive filesystem work is done by [`scripts/self_update.py`](scripts/self_update.py) —
+a stdlib-only, **offline** helper (the agent does the one network fetch). It backs the install up
+first, verifies the updated `coord` still runs, and **auto-restores the backup if the update
+would break the install**. You can also run it by hand against a fetched tree:
+
+```sh
+python scripts/self_update.py --source <fetched-main> --target <install-dir> --dry-run
+```
 
 ## License
 
