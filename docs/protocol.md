@@ -219,9 +219,10 @@ navigator (or a human) drafts a `fleet` (worker ids + non-overlapping `owned_pat
 `max_concurrent`) and a task DAG (`id`/`deps`/`owned_by`/`verify`), and this is the request, not
 the act. Validation (worker ids unique, `owned_paths` non-empty and pairwise non-overlapping —
 reusing the same `_owned_paths_overlap` rule the write-scope hook enforces on real writes, every
-`task.owned_by`/`deps` resolves, every task carries a `verify` key, no task id collides with the
-live board) all runs before anything is written; any failure exits non-zero with **nothing**
-written. **Does not bump `desired.version`.**
+`task.owned_by`/`deps` resolves, the task DAG is **acyclic** — a dependency cycle would deadlock
+at claim time, since no task in it can ever be claimed — every task carries a `verify` key, no
+task id collides with the live board) all runs before anything is written; any failure exits
+non-zero with **nothing** written. **Does not bump `desired.version`.**
 
 ```
 $ coord plan propose --session nav --file plan1.json
@@ -253,6 +254,31 @@ plan 1783555685181644600  status=pending  as_of=0
   tasks (proposed):
     build-a              owned_by=w1  build A
     build-b              owned_by=w2  build B
+```
+
+### `coord plan analyze --file PLAN.json [--json]` (or pipe the plan document on stdin)
+Read-only **shape** analysis of a proposed plan — the work-routing signals a navigator uses to
+judge parallelism and worker isolation *before* proposing. Writes nothing. Reports the topological
+`waves` and `peak_parallel_width`, the `critical_path` (longest dependency chain) and its length,
+the **cross-worker dependencies** (edges where a task depends on work another worker owns — the
+coupling that erodes worktree isolation), high-fan-in **prelude candidates** (tasks two or more
+others depend on — pin these down as contracts first), per-worker load, any `cyclic_tasks`, and
+the `errors` `plan propose` would reject. `--json` emits the full report.
+
+```
+$ coord plan analyze --file plan1.json
+tasks=4  workers=2  max_concurrent=2
+waves=3  peak_parallel_width=2  critical_path_length=3
+  wave 1: a
+  wave 2: b, c
+  wave 3: d
+critical path: a -> c -> d
+cross-worker deps: 2
+  c(w-ui) depends on a(w-api)
+  d(w-ui) depends on b(w-api)
+prelude candidates (high fan-in -- pin these down as contracts first):
+  a  <- 2 dependents  owner=w-api
+worker load: {"w-api": 2, "w-ui": 2}
 ```
 
 ### `coord plan approve --id PID [--session ID]`
