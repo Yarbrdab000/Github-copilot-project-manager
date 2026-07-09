@@ -224,3 +224,49 @@ def test_tick_with_no_fleet_declared_does_not_crash_and_spawns_nothing(coord):
     report = json.loads(tick.stdout)
     assert report["spawned"] == []
     assert _spawn_directives(coord) == []
+
+
+# --- regression: a declared worker that owns no task must not let tick breach the cap ---
+def test_tick_never_exceeds_cap_when_a_declared_worker_owns_no_task(coord, tmp_path):
+    # COCKPIT_SPEC.md §3.1: max_concurrent is a HARD cap on simultaneously-live workers.
+    # approve emits spawn directives positionally (workers[:max_concurrent]), so a declared
+    # worker that owns no task can still hold a slot. tick must count that slot; otherwise it
+    # spawns one worker too many and the live fleet breaches the declared cap.
+    doc = {
+        "note": "n",
+        "fleet": {
+            "max_concurrent": 2,
+            "workers": [
+                {"id": "w-idle", "owned_paths": ["src/w-idle/**"]},   # owns NO task
+                {"id": "w-api", "owned_paths": ["src/w-api/**"]},
+                {"id": "w-ui", "owned_paths": ["src/w-ui/**"]},
+            ],
+        },
+        "tasks": [
+            {"id": "api-task", "desc": "d", "owned_by": "w-api", "deps": [], "verify": None},
+            {"id": "ui-task", "desc": "d", "owned_by": "w-ui", "deps": [], "verify": None},
+        ],
+    }
+    _propose_and_approve_plan(coord, doc, tmp_path)
+    # approve spawned workers[:2] = w-idle, w-api (positional -- w-idle owns no task).
+    assert {d["worker"] for d in _spawn_directives(coord)} == {"w-idle", "w-api"}
+
+    coord("state", "set", "--session", "orch", "--key", "authorized_phase", "--value", "3")
+    before = json.loads(coord("state", "show").stdout)
+
+    tick = coord("tick")
+    assert tick.returncode == 0, tick.stderr
+    report = json.loads(tick.stdout)
+
+    # cap is 2: distinct spawn directives (each becomes a live session) must never exceed it.
+    distinct = {d["worker"] for d in _spawn_directives(coord)}
+    assert len(distinct) <= 2, f"cap breached: {distinct} exceeds max_concurrent=2"
+    assert report["spawned"] == []
+    # unmet demand for w-ui surfaces as exactly one decision escalation.
+    decisions = [e for e in _escalations(coord) if e["kind"] == "decision"
+                 and e["body"] == "fleet at cap; raise max_concurrent or wait"]
+    assert len(decisions) == 1
+    # tick invariant unchanged.
+    after = json.loads(coord("state", "show").stdout)
+    assert after["version"] == before["version"]
+    assert after["desired"].get("authorized_phase") == before["desired"].get("authorized_phase") == 3

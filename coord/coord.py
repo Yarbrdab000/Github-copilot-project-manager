@@ -1214,10 +1214,15 @@ def _tick_once() -> dict:
         # consumer yet) spawn directive counts toward the cap but is NOT re-emitted.
         existing_spawn_ids = {d.get("worker") for d in _read_jsonl(_p("state", "directives.jsonl"))
                                if d.get("kind") == "spawn"}
-        already_in_flight = [w for w in missing_workers if w.get("id") in existing_spawn_ids]
         new_candidates = [w for w in missing_workers if w.get("id") not in existing_spawn_ids]
 
-        capacity_used = len(live_ids) + len(already_in_flight)
+        # Every worker already live OR already holding an unconsumed spawn directive occupies
+        # a real concurrency slot -- including a declared worker that owns no task, whose
+        # directive `plan approve` emits positionally (workers[:max_concurrent]) and which
+        # therefore never appears in `missing_workers`. Count the union of both so that slot is
+        # never invisible to the cap; otherwise tick can spawn one worker too many and the live
+        # fleet breaches the declared hard cap (COCKPIT_SPEC.md §3.1).
+        capacity_used = len(live_ids | existing_spawn_ids)
         capacity_remaining = max(max_concurrent - capacity_used, 0)
         to_spawn, over_cap = new_candidates[:capacity_remaining], new_candidates[capacity_remaining:]
 
