@@ -366,6 +366,148 @@ it escalated once and stopped, exactly the honest runtime seam [`architecture.md
 
 ---
 
+## Walkthrough E — navigator proposes a fleet plan, human approves, `tick` spawns
+
+This traces the whole-fleet plan seam (COCKPIT_SPEC §3.2–§3.6): a navigator drafts a 2-worker plan
+as a proposal, a human approves it, and `tick`'s spawn step (advisory, same honest seam as
+dispatch — see [`architecture.md`](./architecture.md) §8–9) picks up the newly-declared fleet.
+Use a scratch `COORD_ROOT`:
+
+```sh
+export COORD_ROOT="$(mktemp -d)"    # PowerShell: $env:COORD_ROOT = Join-Path $env:TEMP ([guid]::NewGuid())
+coord init
+```
+
+### 1. The navigator drafts a plan document and proposes it
+
+A plan declares the fleet (worker ids + non-overlapping owned paths + `max_concurrent`) and the
+task DAG in one document. `coord plan propose` validates it and writes it **pending** — this does
+**not** touch `desired.json`:
+
+```json
+// fleet_plan.json
+{
+  "note": "stand up a 2-worker fleet for feature X",
+  "fleet": {
+    "max_concurrent": 2,
+    "workers": [
+      { "id": "w1", "owned_paths": ["src/w1/**"] },
+      { "id": "w2", "owned_paths": ["src/w2/**"] }
+    ]
+  },
+  "tasks": [
+    { "id": "build-frontend", "desc": "build the frontend piece", "owned_by": "w1", "deps": [], "verify": null },
+    { "id": "build-backend",  "desc": "build the backend piece",  "owned_by": "w2", "deps": [], "verify": null }
+  ]
+}
+```
+
+```sh
+coord plan propose --session nav --file fleet_plan.json
+# -> proposed plan 1783555829043092300 (pending; desired.version unchanged at 0)
+# ->   fleet: {"max_concurrent": 0, "workers": []} -> {"max_concurrent": 2, "workers": [{"id": "w1", "owned_paths": ["src/w1/**"]}, {"id": "w2", "owned_paths": ["src/w2/**"]}]}
+# ->   tasks: 0 -> 2
+# ->     + build-frontend owned_by=w1
+# ->     + build-backend owned_by=w2
+```
+
+A navigator session running this for real is constrained by the write-scope hook to exactly this
+allow-list (`plan propose`/`plans`/`plan show`/`cockpit`, plus its existing `state propose` lever)
+— it cannot run `plan approve` itself (see [`hooks/README.md`](../hooks/README.md)).
+
+### 2. The human reviews it
+
+```sh
+coord plans
+# -> 1783555829043092300  as_of=0  workers=2  tasks=2  note=stand up a 2-worker fleet for feature X
+
+coord plan show --id 1783555829043092300
+# -> plan 1783555829043092300  status=pending  as_of=0
+# ->   note: stand up a 2-worker fleet for feature X
+# ->   fleet current:  {"max_concurrent": 0, "workers": []}
+# ->   fleet proposed: {"max_concurrent": 2, "workers": [{"id": "w1", "owned_paths": ["src/w1/**"]}, {"id": "w2", "owned_paths": ["src/w2/**"]}]}
+# ->   tasks (proposed):
+# ->     build-frontend       owned_by=w1  build the frontend piece
+# ->     build-backend        owned_by=w2  build the backend piece
+```
+
+### 3. A human (or the orchestrator, on their behalf) approves it
+
+```sh
+coord plan approve --session orch --id 1783555829043092300
+# -> approved 1783555829043092300: 2 tasks created; desired.fleet set; state version -> 1
+# ->   spawn directives: ['w1', 'w2']
+```
+
+Both plan tasks are now real, open tasks on the board, `desired.fleet` is set, `desired.version`
+bumped by exactly 1 (never `authorized_phase`), and the initial `spawn` directives for `w1`/`w2`
+are already queued — capped at `max_concurrent` (2 here, so both fit).
+
+### 4. `tick` reconciles the newly-declared fleet
+
+```sh
+coord tick
+```
+```json
+{
+  "reaped": [],
+  "verified": [],
+  "requeued": [],
+  "spawned": [],
+  "dispatched": [],
+  "nudged": [],
+  "failed": [],
+  "awaiting_decision": []
+}
+```
+
+`spawned` is empty here — not a bug: `plan approve` already emitted the `w1`/`w2` spawn
+directives, and `tick`'s spawn step is **idempotent** (any worker with a spawn directive already
+in the ledger counts as in-flight and is never re-spawned). If a real runtime adapter later
+consumes those directives and the workers still don't come up live, the *next* human-approved
+plan or a raised `max_concurrent` is how you'd escalate — `tick` itself only re-spawns a worker
+once it truly has none in flight.
+
+### 5. `coord cockpit` shows the whole plane in one read
+
+```sh
+coord cockpit --json
+```
+```json
+{
+  "desired": {
+    "version": 1,
+    "authorized_phase": null,
+    "fleet": { "max_concurrent": 2, "workers": ["w1", "w2"] }
+  },
+  "tasks": {
+    "counts": { "open": 2 },
+    "by_status": { "open": ["build-frontend", "build-backend"], "claimed": [], "done": [], "failed": [] }
+  },
+  "workers": [
+    { "id": "w1", "liveness": "stale", "heartbeat_age_sec": null, "task": null },
+    { "id": "w2", "liveness": "stale", "heartbeat_age_sec": null, "task": null }
+  ],
+  "decisions": [],
+  "blockers": [],
+  "pending": { "plans": [], "proposals": [] },
+  "capacity": {
+    "live": 0,
+    "max_concurrent": 2,
+    "unconsumed_spawn_directives": 2,
+    "unconsumed_spawn_workers": ["w1", "w2"]
+  }
+}
+```
+
+Both `w1` and `w2` show `"liveness": "stale"` because nothing has registered under those session
+ids yet in this scratch plane — that's the Phase 7 runtime adapter's job (consume the `spawn`
+directive, actually start the session, which then registers and heartbeats). `coord cockpit` is
+read-only end to end: `desired.version` and every ledger file above are unchanged by having run
+it — it is safe to call at any time, as often as you like.
+
+---
+
 ## Where to go next
 
 - A concrete, worked end-to-end scenario:
