@@ -256,6 +256,33 @@ plan 1783555685181644600  status=pending  as_of=0
     build-b              owned_by=w2  build B
 ```
 
+### `coord plan seams [--root DIR] [--workers N] [--json]`
+Read-only **repo-partition suggester** — the generative complement to `plan analyze`. Instead of
+critiquing a plan you already wrote, it reads the repository's own **intra-repo import graph**
+(`--root`, default `.`) and suggests a partition of the tree into worker-owned path clusters
+("seams") that **minimizes cross-worker coupling**, so each worker gets a vertical slice it can
+build in its own worktree without waiting on another's output. Writes nothing; needs no
+initialized plane. Rolls files up to directory "modules", then greedily keeps the most tightly
+coupled modules together so the cut *between* seams stays small. With no `--workers`, it returns
+the **natural seams** (connected components that share no imports — free zero-coupling
+parallelism); `--workers N` merges down to (or cuts at the weakest edges to reach) N. Each seam's
+`owned_paths` are emitted as plan-ready globs; each `cross_cluster_edges` entry is a shared file
+pair — a contract to pin down first. The import scan is heuristic (Python, JS/TS, C includes +
+directory structure), so treat the result as a starting point to refine, then `analyze`.
+
+```
+$ coord plan seams --root . --workers 2
+root=.  files=5  modules=3  import_edges=4
+natural_seams(zero-coupling components)=1  seams=2 (requested 2)
+  seam-1: files=3  internal_edges=1
+      shared/**
+      ui/**
+  seam-2: files=2  internal_edges=0
+      api/**
+cross-seam coupling: 1 edges, weight 1 (minimize this)
+  api(seam-2) <-> shared(seam-1)  x1  -- shared seam: pin this contract down first
+```
+
 ### `coord plan analyze --file PLAN.json [--json]` (or pipe the plan document on stdin)
 Read-only **shape** analysis of a proposed plan — the work-routing signals a navigator uses to
 judge parallelism and worker isolation *before* proposing. Writes nothing. Reports the topological

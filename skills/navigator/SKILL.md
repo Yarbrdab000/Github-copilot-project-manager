@@ -75,6 +75,30 @@ Turn a human goal into a `coord plan propose` document — a request, not an act
   (orchestrator-only, exactly like `state approve`), and you cannot run it: the hook denies
   `coord plan approve`/`coord plan reject` for every non-orchestrator role, including yours.
 
+### Find the seams first
+
+Before you hand-draw owned-path boundaries, let the repository tell you where they already
+are. `coord plan seams [--root .] [--workers N] [--json]` (read-only) reads the codebase's own
+intra-repo import graph and suggests a partition into worker-owned path clusters ("seams") that
+**minimizes cross-worker coupling** — so each worker gets a slice it can build in its own
+worktree without waiting on another's output:
+
+- Run it with no `--workers` first to see the **natural seams** — the connected components that
+  share *no* imports at all. Those are free, zero-coupling parallelism: hand each to a different
+  worker and they never block each other.
+- If there are more natural seams than you have workers, pass `--workers N` to merge down to N.
+  If there are fewer, `--workers N` cuts the graph at its **weakest** edges, so the tightly
+  coupled files stay together and only the loosest links become hand-offs.
+- Lift each seam's `owned_paths` straight into your `plan propose` fleet — they are already
+  emitted as globs (`src/api/**`).
+- Every `cross_cluster_edges` entry is a file pair two seams share: a **contract to pin down
+  first** (make it a wave-1 prelude task, see below). Drive `cross_cluster_edge_weight` toward
+  zero — it is the exact coupling that erodes worktree isolation.
+
+`seams` is a heuristic starting point, not gospel: it reasons from static imports (Python, JS/TS,
+C includes) and directory structure, so review its suggestion, fold in domain knowledge, then
+draft the plan and `analyze` it.
+
 ### Analyze before you propose
 
 `coord plan analyze --file <plan.json>` (read-only; also reads a document on stdin) shows a

@@ -15,7 +15,7 @@ Design principles (see docs/protocol.md):
 Stdlib only. Python 3.8+.  Run `coord --help`.
 """
 from __future__ import annotations
-import argparse, json, os, sys, time, glob, fnmatch
+import argparse, json, os, sys, time, glob, fnmatch, re, posixpath
 from pathlib import Path
 
 # ---- layout ---------------------------------------------------------------
@@ -609,6 +609,8 @@ def cmd_plan(a):
         _plan_reject(a)
     elif a.action == "analyze":
         _plan_analyze_cmd(a)
+    elif a.action == "seams":
+        _plan_seams_cmd(a)
 
 
 def _plan_propose(a):
@@ -787,6 +789,309 @@ def _plan_analyze_cmd(a):
         print("validation errors (plan propose would reject this plan):")
         for e in r["errors"]:
             print(f"  - {e}")
+
+
+# --- work-routing: repo seam detection (`coord plan seams`) ------------------
+# The GENERATIVE complement to `plan analyze`. Instead of critiquing a plan a human
+# already wrote, read the repository's own import graph and SUGGEST a partition of the
+# tree into worker-owned path clusters ("seams") that minimizes cross-worker coupling,
+# so each worker gets a vertical slice it can build in its own worktree without waiting
+# on another worker's output. Read-only, deterministic, and heuristic -- a starting
+# point the navigator refines, then feeds into `plan propose` + `plan analyze`.
+_SEAM_SKIP_DIRS = {
+    ".git", ".hg", ".svn", "node_modules", "__pycache__", ".venv", "venv", "env",
+    "dist", "build", "out", "target", ".mypy_cache", ".pytest_cache", ".ruff_cache",
+    ".tox", ".idea", ".vscode", ".coordination", ".next", "coverage", ".gradle", "vendor",
+}
+_SEAM_TEXT_EXT = {
+    ".py", ".pyi", ".js", ".jsx", ".ts", ".tsx", ".mjs", ".cjs",
+    ".c", ".h", ".cc", ".cpp", ".hpp", ".cxx",
+}
+_PY_IMPORT_RE = re.compile(r"^[ \t]*(?:from[ \t]+([.\w]+)[ \t]+import\b|import[ \t]+([\w][\w.]*))", re.M)
+_JS_IMPORT_RE = re.compile(r"""(?:\bfrom[ \t]*|\brequire[ \t]*\([ \t]*|\bimport[ \t]*\([ \t]*|\bimport[ \t]+)['"]([^'"]+)['"]""")
+_C_INCLUDE_RE = re.compile(r'^[ \t]*#[ \t]*include[ \t]*"([^"]+)"', re.M)
+
+
+def _seam_module_of(relpath: str) -> str:
+    """The 'module' a file belongs to for clustering: its containing directory
+    (posix), or '.' for a file at the repo root."""
+    d = posixpath.dirname(relpath)
+    return d if d else "."
+
+
+def _seam_owned_path(module: str) -> str:
+    """Turn a module directory into an owned-path glob suitable to drop into a plan
+    fleet ('src/api' -> 'src/api/**'; the root module -> '*')."""
+    return "*" if module == "." else module + "/**"
+
+
+def _seam_iter_files(root):
+    """Yield repo-relative posix paths of candidate source files under `root`, pruning
+    VCS/build/dependency directories. Deterministic (sorted)."""
+    root = str(root)
+    out = []
+    for dirpath, dirnames, filenames in os.walk(root):
+        dirnames[:] = sorted(d for d in dirnames if d not in _SEAM_SKIP_DIRS)
+        for fn in filenames:
+            if posixpath.splitext(fn)[1].lower() in _SEAM_TEXT_EXT:
+                rel = os.path.relpath(os.path.join(dirpath, fn), root)
+                out.append(rel.replace(os.sep, "/"))
+    return sorted(out)
+
+
+def _seam_resolve_python(src, module, fileset):
+    """Resolve a Python import (absolute dotted or leading-dot relative) to a repo
+    file in `fileset`, or None if it is external/unresolvable."""
+    src_dir = posixpath.dirname(src)
+    if module.startswith("."):
+        n_up = len(module) - len(module.lstrip("."))
+        rest = module[n_up:]
+        base = src_dir
+        for _ in range(n_up - 1):
+            base = posixpath.dirname(base)
+        parts = [p for p in rest.split(".") if p]
+        if parts:
+            stem = ("/".join([base] + parts)) if base else "/".join(parts)
+            cands = [stem + ".py", posixpath.join(stem, "__init__.py")]
+        else:
+            cands = [posixpath.join(base, "__init__.py") if base else "__init__.py"]
+        for c in cands:
+            c = c.lstrip("/")
+            if c in fileset:
+                return c
+        return None
+    parts = module.split(".")
+    for depth in range(len(parts), 0, -1):
+        stem = "/".join(parts[:depth])
+        for c in (stem + ".py", posixpath.join(stem, "__init__.py")):
+            if c in fileset:
+                return c
+    return None
+
+
+def _seam_resolve_relative(src, spec, fileset, exts):
+    """Resolve a relative JS/TS (or C include) specifier against the source dir,
+    trying `exts` and an index/ barrel file. Bare specifiers return None."""
+    if not spec.startswith("."):
+        return None
+    base = posixpath.normpath(posixpath.join(posixpath.dirname(src), spec))
+    cands = [base] + [base + e for e in exts] + [posixpath.join(base, "index" + e) for e in exts]
+    for c in cands:
+        if c in fileset:
+            return c
+    return None
+
+
+def _seam_resolve_c(src, inc, fileset):
+    """Resolve a quoted C/C++ #include to a repo file: relative to the source dir
+    first, then a unique repo-wide basename match."""
+    cand = posixpath.normpath(posixpath.join(posixpath.dirname(src), inc))
+    if cand in fileset:
+        return cand
+    base = posixpath.basename(inc)
+    matches = [f for f in fileset if posixpath.basename(f) == base]
+    return matches[0] if len(matches) == 1 else None
+
+
+def _scan_repo_graph(root):
+    """Walk `root` and parse each source file's INTRA-repo imports into an undirected
+    coupling graph. Returns (files, edges): `files` = sorted relpaths; `edges` = sorted
+    list of (a, b) file pairs (a < b) that reference each other. External/package
+    imports are ignored -- they don't couple two worktrees. I/O; deterministic."""
+    files = _seam_iter_files(root)
+    fileset = set(files)
+    _JS_EXT = [".ts", ".tsx", ".js", ".jsx", ".mjs", ".cjs", ".d.ts"]
+    edge_set = set()
+    for f in files:
+        ext = posixpath.splitext(f)[1].lower()
+        try:
+            text = (Path(root) / f).read_text(encoding="utf-8", errors="ignore")
+        except OSError:
+            continue
+        targets = set()
+        if ext in (".py", ".pyi"):
+            for m in _PY_IMPORT_RE.finditer(text):
+                mod = m.group(1) or m.group(2)
+                t = _seam_resolve_python(f, mod, fileset) if mod else None
+                if t:
+                    targets.add(t)
+        elif ext in (".js", ".jsx", ".ts", ".tsx", ".mjs", ".cjs"):
+            for m in _JS_IMPORT_RE.finditer(text):
+                t = _seam_resolve_relative(f, m.group(1), fileset, _JS_EXT)
+                if t:
+                    targets.add(t)
+        elif ext in (".c", ".h", ".cc", ".cpp", ".hpp", ".cxx"):
+            for m in _C_INCLUDE_RE.finditer(text):
+                t = _seam_resolve_c(f, m.group(1), fileset)
+                if t:
+                    targets.add(t)
+        for t in targets:
+            if t != f:
+                edge_set.add(tuple(sorted((f, t))))
+    return files, sorted(edge_set)
+
+
+def _module_graph(files, edges):
+    """Pure: roll file-level coupling up to directory 'modules'. Returns
+    (modules, weights): `modules` = sorted unique module dirs; `weights` = dict keyed
+    by a sorted (a, b) module pair -> count of file edges crossing them. Intra-module
+    edges are dropped (always internal / free)."""
+    modules = sorted({_seam_module_of(f) for f in files})
+    weights = {}
+    for a, b in edges:
+        ma, mb = _seam_module_of(a), _seam_module_of(b)
+        if ma == mb:
+            continue
+        key = tuple(sorted((ma, mb)))
+        weights[key] = weights.get(key, 0) + 1
+    return modules, weights
+
+
+def _agglomerate(modules, weights, target_k):
+    """Pure, deterministic agglomerative clustering. Start with each module in its own
+    cluster and repeatedly merge the most tightly-coupled pair -- greedy, so heavy edges
+    end up INSIDE a cluster and the cut BETWEEN clusters stays small. With
+    `target_k=None`, merge every positively-weighted pair: the result is the connected
+    components (the zero-coupling partition). With `target_k` set, stop at K clusters;
+    if the repo has more independent components than K, the extra merges join the
+    SMALLEST clusters (independent groups are forced together only because fewer workers
+    were asked for). A module is atomic, so at most `len(modules)` clusters are possible.
+    Returns a list of clusters, each a sorted list of module names."""
+    clusters = {m: {m} for m in modules}          # cid (a member module) -> set of modules
+    adj = {m: {} for m in modules}                # cid -> {cid: weight}
+    for (a, b), w in weights.items():
+        adj[a][b] = adj[a].get(b, 0) + w
+        adj[b][a] = adj[b].get(a, 0) + w
+
+    def _merge(x, y):
+        clusters[x] |= clusters.pop(y)
+        for nbr, w in adj.pop(y).items():
+            if nbr not in clusters or nbr == x:
+                continue
+            adj[nbr].pop(y, None)
+            adj[x][nbr] = adj[x].get(nbr, 0) + w
+            adj[nbr][x] = adj[nbr].get(x, 0) + w
+        adj[x].pop(y, None)
+
+    def _best_positive():
+        best = None
+        for x in clusters:
+            for y, w in adj[x].items():
+                if w <= 0 or y not in clusters or x >= y:
+                    continue
+                # max weight, then smaller combined size, then lexicographic pair
+                cand = (w, -(len(clusters[x]) + len(clusters[y])), x, y)
+                if best is None or cand > best:
+                    best = cand
+        return (best[2], best[3]) if best else None
+
+    def _smallest_pair():
+        keys = sorted(clusters, key=lambda c: (len(clusters[c]), c))
+        return (keys[0], keys[1]) if len(keys) >= 2 else None
+
+    while True:
+        if target_k is not None and len(clusters) <= target_k:
+            break
+        pair = _best_positive()
+        if pair is None:
+            break
+        _merge(*(pair if pair[0] < pair[1] else (pair[1], pair[0])))
+    if target_k is not None:
+        while len(clusters) > target_k:
+            pair = _smallest_pair()
+            if pair is None:
+                break
+            _merge(*pair)
+
+    return [sorted(members) for members in clusters.values()]
+
+
+def _plan_seams(files, edges, target_k=None, root_label="."):
+    """Pure: from a scanned repo graph, suggest a `target_k`-way (or natural-component)
+    partition into worker seams. Mirrors `_plan_analyze` -- takes already-gathered inputs
+    so it is unit-testable without touching the filesystem, and writes nothing. Returns
+    the seam clusters (with owned-path globs ready for a plan fleet), the natural
+    zero-coupling component count, and the cross-seam coupling edges to minimize (each a
+    shared contract worth pinning down before the workers fork)."""
+    modules, weights = _module_graph(files, edges)
+    components = _agglomerate(modules, weights, None)
+    clusters = _agglomerate(modules, weights, target_k)
+
+    files_by_module = {}
+    for f in files:
+        files_by_module.setdefault(_seam_module_of(f), []).append(f)
+
+    def _cfiles(ms):
+        return sum(len(files_by_module.get(m, [])) for m in ms)
+
+    clusters.sort(key=lambda ms: (-_cfiles(ms), ms))
+    module_to_seam = {m: i for i, ms in enumerate(clusters) for m in ms}
+
+    internal = [0] * len(clusters)
+    cross = []
+    for (a, b), w in sorted(weights.items()):
+        sa, sb = module_to_seam[a], module_to_seam[b]
+        if sa == sb:
+            internal[sa] += w
+        else:
+            cross.append({"a": a, "b": b, "weight": w,
+                          "a_seam": f"seam-{sa + 1}", "b_seam": f"seam-{sb + 1}"})
+    cross.sort(key=lambda e: (-e["weight"], e["a"], e["b"]))
+
+    cluster_objs = [{
+        "id": f"seam-{i + 1}",
+        "modules": ms,
+        "owned_paths": [_seam_owned_path(m) for m in ms],
+        "file_count": _cfiles(ms),
+        "internal_edge_weight": internal[i],
+    } for i, ms in enumerate(clusters)]
+
+    notes = []
+    if target_k is not None and target_k > len(modules) and modules:
+        notes.append(f"requested {target_k} seams but only {len(modules)} modules exist; returning {len(clusters)}")
+
+    return {
+        "root": root_label,
+        "file_count": len(files),
+        "module_count": len(modules),
+        "file_edge_count": len(edges),
+        "module_edge_count": len(weights),
+        "natural_seams": len(components),
+        "requested_workers": target_k,
+        "workers": len(clusters),
+        "clusters": cluster_objs,
+        "cross_cluster_edges": cross,
+        "cross_cluster_edge_count": len(cross),
+        "cross_cluster_edge_weight": sum(e["weight"] for e in cross),
+        "notes": notes,
+    }
+
+
+def _plan_seams_cmd(a):
+    """`coord plan seams [--root DIR] [--workers N] [--json]` -- read-only repo-partition
+    suggester. Scans `--root` (default '.') for intra-repo import coupling and prints a
+    seam partition a navigator can lift into a `plan propose` fleet. Writes nothing."""
+    root_label = getattr(a, "root", None) or "."
+    files, edges = _scan_repo_graph(root_label)
+    r = _plan_seams(files, edges, target_k=getattr(a, "workers", None), root_label=root_label)
+    if getattr(a, "json", False):
+        print(json.dumps(r, indent=2))
+        return
+    print(f"root={r['root']}  files={r['file_count']}  modules={r['module_count']}  "
+          f"import_edges={r['file_edge_count']}")
+    req = f" (requested {r['requested_workers']})" if r["requested_workers"] else ""
+    print(f"natural_seams(zero-coupling components)={r['natural_seams']}  seams={r['workers']}{req}")
+    for c in r["clusters"]:
+        print(f"  {c['id']}: files={c['file_count']}  internal_edges={c['internal_edge_weight']}")
+        for op in c["owned_paths"]:
+            print(f"      {op}")
+    print(f"cross-seam coupling: {r['cross_cluster_edge_count']} edges, "
+          f"weight {r['cross_cluster_edge_weight']} (minimize this)")
+    for e in r["cross_cluster_edges"]:
+        print(f"  {e['a']}({e['a_seam']}) <-> {e['b']}({e['b_seam']})  x{e['weight']}  "
+              f"-- shared seam: pin this contract down first")
+    for n in r["notes"]:
+        print(f"note: {n}")
 
 
 def _plan_approve(a):
@@ -1548,11 +1853,13 @@ def build_parser():
     sub.add_parser("tasks").set_defaults(func=cmd_tasks)
 
     pl = sub.add_parser("plan"); pl.set_defaults(func=cmd_plan)
-    pl.add_argument("action", choices=["propose", "show", "approve", "reject", "analyze"])
+    pl.add_argument("action", choices=["propose", "show", "approve", "reject", "analyze", "seams"])
     pl.add_argument("--file", help="path to a plan JSON document (default: read from stdin)")
     pl.add_argument("--id", help="plan id (pid) for `plan show`/`plan approve`/`plan reject`")
     pl.add_argument("--session", help="session id used as the state-lock holder for `plan approve`")
-    pl.add_argument("--json", action="store_true", help="machine-readable output for `plan analyze`")
+    pl.add_argument("--root", help="repo root to analyze for `plan seams` (default: .)")
+    pl.add_argument("--workers", type=int, help="target seam count for `plan seams` (default: natural components)")
+    pl.add_argument("--json", action="store_true", help="machine-readable output for `plan analyze`/`plan seams`")
 
     sub.add_parser("plans").set_defaults(func=cmd_plans)
 
