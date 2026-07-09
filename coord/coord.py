@@ -488,6 +488,46 @@ def _fold_plans():
     return plans
 
 
+def _toposort_waves(ids, deps_map):
+    """Kahn layered topological sort over a task DAG. `ids` is the node collection and
+    `deps_map[id]` lists the ids that `id` depends on (deps outside `ids` are ignored).
+    Returns `(waves, cyclic)`: `waves` is a list of dependency-ordered levels, each a
+    sorted list of ids whose deps are all satisfied by earlier waves (so a level's tasks
+    can run in parallel); `cyclic` is the sorted list of ids that could never be
+    scheduled because they sit in or downstream of a dependency cycle (empty => a DAG).
+    Pure and deterministic — no I/O."""
+    remaining = set(ids)
+    deps_in = {i: {d for d in deps_map.get(i, []) if d in remaining} for i in remaining}
+    waves = []
+    while remaining:
+        ready = sorted(i for i in remaining if not (deps_in[i] & remaining))
+        if not ready:
+            break  # nothing schedulable => everything left is in/after a cycle
+        waves.append(ready)
+        remaining.difference_update(ready)
+    return waves, sorted(remaining)
+
+
+def _longest_dep_path(ids, deps_map, waves):
+    """Return one longest dependency chain (a list of ids, dependency-first) through the
+    DAG described by `waves` (from `_toposort_waves`); its length is the critical path.
+    A node in wave K always has a dep in wave K-1, so walking from a deepest node down the
+    deepest dep at each step yields a chain of length == len(waves). Deterministic."""
+    wave_of = {i: wi for wi, w in enumerate(waves) for i in w}
+    if not wave_of:
+        return []
+    node = max(wave_of, key=lambda i: (wave_of[i], str(i)))
+    path = [node]
+    while True:
+        deeper = [d for d in deps_map.get(node, []) if d in wave_of]
+        if not deeper:
+            break
+        node = max(deeper, key=lambda d: (wave_of[d], str(d)))
+        path.append(node)
+    path.reverse()
+    return path
+
+
 def _plan_validate(doc: dict, tasks_on_board: dict):
     """Validate a proposed plan document (COCKPIT SPEC §3.2). Returns a list of error
     strings; empty means valid. Pure — takes the current task board as a parameter so
@@ -536,6 +576,18 @@ def _plan_validate(doc: dict, tasks_on_board: dict):
         if "verify" not in t:
             errors.append(f"task '{tid}' is missing the 'verify' key (use null to opt out)")
 
+    # Acyclicity: the task deps must form a DAG. A cycle passes every check above (each
+    # dep references a real plan task) but then deadlocks forever at claim time, since a
+    # task can never be claimed until its deps are done. Reject it up front rather than
+    # letting the fleet wedge silently.
+    deps_map = {t.get("id"): list(t.get("deps") or []) for t in tasks}
+    _, cyclic = _toposort_waves(plan_task_id_set, deps_map)
+    if cyclic:
+        errors.append(
+            f"task deps contain a cycle among {cyclic} — a dependency cycle would "
+            "deadlock at claim time (no task in the cycle can ever be claimed)"
+        )
+
     return errors
 
 
@@ -555,6 +607,8 @@ def cmd_plan(a):
         _plan_approve(a)
     elif a.action == "reject":
         _plan_reject(a)
+    elif a.action == "analyze":
+        _plan_analyze_cmd(a)
 
 
 def _plan_propose(a):
@@ -629,6 +683,110 @@ def _plan_show(a):
     for t in p.get("tasks") or []:
         deps = (" deps=" + ",".join(t.get("deps") or [])) if t.get("deps") else ""
         print(f"    {t.get('id'):<20} owned_by={t.get('owned_by')}{deps}  {t.get('desc', '')}")
+
+
+def _plan_analyze(doc: dict, tasks_on_board: dict) -> dict:
+    """Read-only *shape* analysis of a proposed plan — the work-routing signals a
+    navigator needs to judge whether the plan parallelizes well and whether the workers
+    are actually isolated from one another. Pure: computes only from `doc` (plus the live
+    board, so it can reuse `_plan_validate` as a dry-run preview) and writes nothing.
+
+    Returns: the topological `waves` and `peak_parallel_width`; the `critical_path`
+    (longest dependency chain) and its length; `cross_worker_deps` — every edge where a
+    task depends on work owned by a *different* worker, the coupling that erodes worktree
+    isolation; `prelude_candidates` — tasks two or more others depend on (high fan-in),
+    the contracts worth pinning down first; `worker_load`; any `cyclic_tasks`; and the
+    `errors` `plan propose` would reject the plan for."""
+    tasks = doc.get("tasks") or []
+    ids = []
+    for t in tasks:
+        tid = t.get("id")
+        if tid is not None and tid not in ids:
+            ids.append(tid)
+    owner = {t.get("id"): t.get("owned_by") for t in tasks}
+    deps_map = {t.get("id"): list(t.get("deps") or []) for t in tasks}
+
+    waves, cyclic = _toposort_waves(ids, deps_map)
+    critical_path = _longest_dep_path(ids, deps_map, waves)
+
+    cross = []
+    for t in tasks:
+        tid = t.get("id")
+        to = owner.get(tid)
+        for d in deps_map.get(tid, []):
+            do = owner.get(d)
+            if to is not None and do is not None and to != do:
+                cross.append({"task": tid, "owner": to, "dep": d, "dep_owner": do})
+
+    dependents = {i: 0 for i in ids}
+    for t in tasks:
+        for d in deps_map.get(t.get("id"), []):
+            if d in dependents:
+                dependents[d] += 1
+    prelude = [
+        {"task": i, "dependents": dependents[i], "owner": owner.get(i)}
+        for i in ids if dependents[i] >= 2
+    ]
+    prelude.sort(key=lambda x: (-x["dependents"], str(x["task"])))
+
+    load = {}
+    for t in tasks:
+        o = owner.get(t.get("id"))
+        load[o] = load.get(o, 0) + 1
+
+    return {
+        "task_count": len(ids),
+        "worker_count": len((doc.get("fleet") or {}).get("workers") or []),
+        "max_concurrent": (doc.get("fleet") or {}).get("max_concurrent"),
+        "waves": waves,
+        "peak_parallel_width": max((len(w) for w in waves), default=0),
+        "critical_path": critical_path,
+        "critical_path_length": len(critical_path),
+        "cross_worker_deps": cross,
+        "cross_worker_dep_count": len(cross),
+        "prelude_candidates": prelude,
+        "worker_load": load,
+        "cyclic_tasks": cyclic,
+        "errors": _plan_validate(doc, tasks_on_board),
+    }
+
+
+def _plan_analyze_cmd(a):
+    """`coord plan analyze` — read-only work-routing analysis of a proposed plan document
+    (from --file or stdin). Writes nothing; a navigator runs it BEFORE `plan propose` to
+    see the plan's shape and re-slice for better worker isolation before asking for a
+    human's approval."""
+    try:
+        doc = _plan_read_doc(a)
+    except (OSError, json.JSONDecodeError) as e:
+        _die(f"could not read plan document: {e}")
+        return
+    r = _plan_analyze(doc, _fold_tasks())
+    if getattr(a, "json", False):
+        print(json.dumps(r, indent=2))
+        return
+    print(f"tasks={r['task_count']}  workers={r['worker_count']}  max_concurrent={r['max_concurrent']}")
+    print(f"waves={len(r['waves'])}  peak_parallel_width={r['peak_parallel_width']}  "
+          f"critical_path_length={r['critical_path_length']}")
+    for i, w in enumerate(r["waves"]):
+        print(f"  wave {i + 1}: {', '.join(str(x) for x in w)}")
+    if r["critical_path"]:
+        print(f"critical path: {' -> '.join(str(x) for x in r['critical_path'])}")
+    print(f"cross-worker deps: {r['cross_worker_dep_count']}")
+    for c in r["cross_worker_deps"]:
+        print(f"  {c['task']}({c['owner']}) depends on {c['dep']}({c['dep_owner']})")
+    if r["prelude_candidates"]:
+        print("prelude candidates (high fan-in -- pin these down as contracts first):")
+        for p in r["prelude_candidates"]:
+            print(f"  {p['task']}  <- {p['dependents']} dependents  owner={p['owner']}")
+    if r["worker_load"]:
+        print(f"worker load: {json.dumps(r['worker_load'])}")
+    if r["cyclic_tasks"]:
+        print(f"WARNING: cyclic tasks would deadlock: {', '.join(str(x) for x in r['cyclic_tasks'])}")
+    if r["errors"]:
+        print("validation errors (plan propose would reject this plan):")
+        for e in r["errors"]:
+            print(f"  - {e}")
 
 
 def _plan_approve(a):
@@ -1378,10 +1536,11 @@ def build_parser():
     sub.add_parser("tasks").set_defaults(func=cmd_tasks)
 
     pl = sub.add_parser("plan"); pl.set_defaults(func=cmd_plan)
-    pl.add_argument("action", choices=["propose", "show", "approve", "reject"])
+    pl.add_argument("action", choices=["propose", "show", "approve", "reject", "analyze"])
     pl.add_argument("--file", help="path to a plan JSON document (default: read from stdin)")
     pl.add_argument("--id", help="plan id (pid) for `plan show`/`plan approve`/`plan reject`")
     pl.add_argument("--session", help="session id used as the state-lock holder for `plan approve`")
+    pl.add_argument("--json", action="store_true", help="machine-readable output for `plan analyze`")
 
     sub.add_parser("plans").set_defaults(func=cmd_plans)
 

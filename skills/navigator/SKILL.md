@@ -69,6 +69,31 @@ Turn a human goal into a `coord plan propose` document — a request, not an act
   (orchestrator-only, exactly like `state approve`), and you cannot run it: the hook denies
   `coord plan approve`/`coord plan reject` for every non-orchestrator role, including yours.
 
+### Analyze before you propose
+
+`coord plan analyze --file <plan.json>` (read-only; also reads a document on stdin) shows a
+plan's *shape* before you ask a human to approve it: topological `waves`, `peak_parallel_width`,
+`critical_path_length`, the **cross-worker dependencies**, and high-fan-in **prelude
+candidates**. Use it to re-slice for isolation and throughput:
+
+- **Contracts first, then fork-join.** Make the interfaces every worker shares — schemas, API
+  shapes, fixtures — a single wave-1 *prelude* task (analyze flags these as high-fan-in "prelude
+  candidates"). Land the contract, then let workers fork and build against it in parallel and
+  only re-join to integrate. Workers that agree a contract up front don't block on each other
+  mid-flight.
+- **Drive cross-worker deps toward zero.** Each `cross_worker_deps` edge is a point where one
+  worker waits on another's output — a serialization point and a hand-off risk that erodes
+  worktree isolation. Prefer giving each worker a *vertical* slice it can own end-to-end (its own
+  paths + its own tests) over a horizontal split that forces constant hand-offs.
+- **Right-size granularity.** A task is one focused unit a worker can `verify` on its own. Aim
+  for `peak_parallel_width` near the fleet's `max_concurrent` (much higher just queues work; much
+  lower leaves workers idle), and remember `critical_path_length` bounds wall-clock — a long thin
+  chain won't go faster with more workers, so look for independent work to widen it.
+
+`analyze` never writes; it also previews the `errors` `plan propose` would reject — including a
+dependency **cycle**, which `propose`/`approve` now refuse outright (a cycle would otherwise
+deadlock at claim time, since no task in it can ever be claimed).
+
 ### Cockpit
 
 Read `coord cockpit [--json]` to answer "what is the fleet doing / what needs the human right

@@ -103,6 +103,8 @@ def test_navigator_bash_denied(nav, command):
     "coord state show",
     "coord status",
     "coord tasks",
+    "coord plan analyze --file plan.json",
+    "coord plan analyze --file plan.json --json",
     "git status",
     "git log --oneline -5",
     "git diff",

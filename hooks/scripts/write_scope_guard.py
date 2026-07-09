@@ -22,7 +22,7 @@ with the ``COORD_SESSION`` env var), then:
 
 A ``navigator``-role session is special (NAVIGATOR_SPEC §4, extended by COCKPIT_SPEC §3.2):
 all file-editing tools are denied outright, and ``bash`` is restricted to an allow-list —
-``coord state propose/proposals/show``, ``coord plan propose/show``, ``coord plans``,
+``coord state propose/proposals/show``, ``coord plan propose/show/analyze``, ``coord plans``,
 ``coord cockpit``, ``coord status``, ``coord tasks``, and read-only inspection (``git
 status|log|diff|show``, ``cat``, ``ls``, ``grep``, ``find``) — with everything else
 (incl. ``coord plan approve``/``coord plan reject`` and any output redirection) denied.
@@ -194,7 +194,7 @@ def _check_bash(command: str, session_branch: str, worktree: str, role: str = ""
 # may only propose desired-state changes and read. Its bash is an ALLOW-LIST
 # (deny by default); all file-editing tools are denied outright.
 NAV_COORD_STATE_ALLOWED = {"propose", "proposals", "show"}
-NAV_COORD_PLAN_ALLOWED = {"propose", "show"}
+NAV_COORD_PLAN_ALLOWED = {"propose", "show", "analyze"}  # analyze is read-only, like show
 NAV_COORD_TOP_ALLOWED = {"status", "tasks", "plans", "cockpit"}
 NAV_READONLY_CMDS = {"cat", "ls", "grep", "find"}
 NAV_GIT_READONLY = {"status", "log", "diff", "show"}
@@ -274,7 +274,7 @@ def _check_navigator_bash(command: str):
         if not _nav_segment_allowed(seg):
             return "deny", (
                 "navigator role may only run 'coord state propose/proposals/show', "
-                "'coord plan propose/show', 'coord plans', 'coord cockpit', "
+                "'coord plan propose/show/analyze', 'coord plans', 'coord cockpit', "
                 "'coord status', 'coord tasks', and read-only inspection "
                 "(git status|log|diff|show, cat, ls, grep, find) — denied: " + seg.strip()
             )
