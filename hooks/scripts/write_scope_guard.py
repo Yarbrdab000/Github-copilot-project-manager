@@ -19,6 +19,10 @@ with the ``COORD_SESSION`` env var), then:
     fleet+tasks is the human-gated seam) — covers the alias and spelled-out invocation, and
     any segment of a compound (``&&``/``;``/``|``) command. Otherwise allow.
   * read tools (grep/glob/view/...): always **allow**.
+  * human-prompt tools (``ask_user``): **deny** for any registered coordinated session
+    (every role) and redirect to ``coord escalate`` -- such a modal blocks the session
+    and the cockpit cannot clear it, stalling every dispatch queued behind it.
+    Unregistered sessions fail **open**.
 
 A ``navigator``-role session is special (NAVIGATOR_SPEC §4, extended by COCKPIT_SPEC §3.2):
 all file-editing tools are denied outright, and ``bash`` is restricted to an allow-list —
@@ -47,6 +51,19 @@ WRITE_TOOLS = {"edit", "create", "str_replace", "write", "create_file", "apply_p
 PATH_KEYS = ("path", "file_path", "filePath", "filename")
 ROOT_ENV = "COORD_ROOT"
 DEFAULT_DIR = ".coordination"
+
+# Direct human-prompt tools: a coordinated session that opens one of these blocks on a
+# modal the cockpit cannot clear, stalling every dispatch queued behind it. They are
+# denied for any registered session (all roles) and redirected to the escalation channel.
+PROMPT_TOOLS = {"ask_user"}
+_PROMPT_DENY_REASON = (
+    "coordinated sessions must not prompt the human directly -- a modal blocks this "
+    "session and the cockpit cannot clear it, so every queued dispatch stalls behind it. "
+    "Raise the question on the escalation channel instead: "
+    "`coord escalate --session <id> --kind decision --body \"...\"`, then yield. The "
+    "human answers in the cockpit and `coord resolve` delivers the decision to your next "
+    "`coord checkpoint`."
+)
 
 
 def _log(msg: str) -> None:
@@ -294,6 +311,16 @@ def main() -> None:
 
     tool = str(payload.get("toolName") or "").strip().lower()
     cwd = payload.get("cwd") or ""
+
+    # Direct human-prompt tools (e.g. ask_user): deny for any registered coordinated
+    # session (every role) and redirect to the escalation channel; an unregistered
+    # session fails open. This runs before the read-tool allow-through below, since
+    # ask_user is otherwise an ordinary non-write, non-bash tool.
+    if tool in PROMPT_TOOLS:
+        if _resolve_session(cwd):
+            _emit("deny", _PROMPT_DENY_REASON)
+        _log(f"prompt tool {tool!r} from an unresolved session (cwd={cwd!r}); allowing (fail-open)")
+        _allow()
 
     # Read tools (and anything that is not a write tool or bash) → always allow.
     if tool not in WRITE_TOOLS and tool != "bash":

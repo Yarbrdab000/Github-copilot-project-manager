@@ -48,6 +48,12 @@ Read and inspect freely — `coord state show`, `coord state proposals`, `coord 
 `coord tasks`, and read-only `git status|log|diff|show`, `cat`, `ls`, `grep`, `find` — so every
 proposal is concrete and reviewable. Then hand the decision to the human.
 
+**Ask in the conversation, never in a blocking modal.** Do not use the `ask_user` tool — a modal
+stalls your session and the cockpit cannot clear it. When you are running unattended and need a
+decision, `coord escalate --session $ID --kind decision --body "..."` and yield; the human
+answers in the cockpit and `coord resolve` returns it to your next `coord checkpoint` (see
+`coordination-protocol`).
+
 ## Planning and the cockpit view (COCKPIT_SPEC §3.2, §3.6)
 
 **Navigator has no authority: it proposes and reads, never approves, dispatches, spawns, merges,

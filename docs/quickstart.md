@@ -360,6 +360,13 @@ coord escalations
 # -> (no open escalations)
 ```
 
+When an escalation was raised *by a worker* (its `from` field names a live session), `coord
+resolve` also delivers the `--note` back to that worker as a checkpoint message tied to the
+current `desired.version`, closing the loop — so the escalation channel is a real
+question→answer round-trip a session can use *instead of* a blocking prompt. (This example's
+escalation came from `tick`, which has no asking session, so only the operator-facing resolution
+above applies.)
+
 `tick` never retried past `max_attempts` on its own, and it never silently dropped the failure —
 it escalated once and stopped, exactly the honest runtime seam [`architecture.md`](./architecture.md)
 §8 describes: the control plane records the directive and the failure; a human makes the call.

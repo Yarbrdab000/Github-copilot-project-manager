@@ -7,7 +7,7 @@ in prose the model can skip. They are wired by [`.github/hooks/coordination.json
 | Event | Script | What it does |
 | --- | --- | --- |
 | `sessionStart` | [`scripts/session_register.sh`](scripts/session_register.sh) | Registers the session in the control plane (`coord register`) and writes a first heartbeat. |
-| `preToolUse` | [`scripts/write_scope_guard.py`](scripts/write_scope_guard.py) | Denies any file write outside the session's owned paths, plus `git push` / off-branch checkouts / stray redirects. |
+| `preToolUse` | [`scripts/write_scope_guard.py`](scripts/write_scope_guard.py) | Denies any file write outside the session's owned paths, plus `git push` / off-branch checkouts / stray redirects — and denies direct human-prompt tools (`ask_user`), redirecting the session to `coord escalate`. |
 
 ## How the write-scope guard works
 
@@ -25,7 +25,10 @@ The guard:
    `owned_paths` globs.
 3. For `bash` it best-effort **denies** `git push`, a checkout/switch to a branch other than
    the session's, and redirects to absolute paths outside the worktree.
-4. It **allows** every read tool.
+4. For direct human-prompt tools (`ask_user`) it **denies** the call for any resolved session
+   (every role) and points it at `coord escalate` — a blocking modal would stall the whole
+   fleet, and the cockpit the human watches cannot clear it.
+5. It **allows** every read tool.
 
 It replies with `{"permissionDecision":"allow"}` or
 `{"permissionDecision":"deny","permissionDecisionReason":"..."}` and exits 0.
@@ -34,6 +37,13 @@ It replies with `{"permissionDecision":"allow"}` or
 cannot evaluate — an unparseable payload, an unresolved session, a missing path, an
 unexpected error — fails *open* (allow, logged to stderr) so a broken hook never wedges every
 tool call. This matches Copilot's own timeout = fail-open stance.
+
+**Honest seam on the prompt rule.** The guard denies `ask_user` whenever Copilot routes it
+through `preToolUse`. If a runtime treats `ask_user` as an internal interaction that does *not*
+fire a tool hook, the guard never sees it — so the load-bearing guarantee is the **discipline**
+(every role's skill says "never prompt directly; `coord escalate` and yield") plus the
+**round-trip** (`coord resolve` delivers the human's answer back as a checkpoint message). The
+hook is defense-in-depth on top of those two.
 
 ## Install / enable
 
