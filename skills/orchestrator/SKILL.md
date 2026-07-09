@@ -38,6 +38,10 @@ At each of your checkpoints (follow the ritual in `coordination-protocol`):
 3. Steer with **state, not chatter**: when the plan changes, `coord state set ...` (bumping
    the version) so every worker reconciles at its next checkpoint. Use
    `coord send --as-of <version>` only for targeted nudges.
+4. **Never stop to open a prompt modal.** When you hit a decision you cannot make, `coord
+   escalate --session orchestrator --kind decision --body "..."` and let the human answer in
+   the cockpit — a blocking `ask_user` would stall the loop and the cockpit cannot clear it.
+   Their answer returns to you as a checkpoint message when they `coord resolve` it.
 
 ## Integrate and finish
 

@@ -34,6 +34,10 @@ output, and exit code.
    pure reconciliation pass (reap, verify, dispatch, nudge, budgets, surface escalations);
    `coord run` is a thin bounded loop over it. Neither ever changes `authorized_phase` or
    approves a proposal — see [`architecture.md`](./architecture.md) §8.
+10. **Sessions never prompt the human directly.** A session needing a decision raises `coord
+    escalate` and yields; the human answers in the cockpit and `coord resolve` delivers that
+    answer back as a checkpoint message. A blocking prompt modal (e.g. `ask_user`) would stall
+    the fleet — the cockpit cannot clear it — so the `preToolUse` hook denies it for every role.
 
 ## Invariants
 
@@ -428,7 +432,8 @@ $ coord reap
 
 ### `coord escalate --session ID --kind decision|blocker|fork --body TEXT [--task ID]`
 Raise a human-facing escalation — the seam a stuck worker or an automated `tick` pass uses to
-stop and ask, instead of guessing. Records the current desired-state version as `as_of` and
+stop and ask, instead of guessing (or opening a blocking prompt modal that the cockpit cannot
+clear). Records the current desired-state version as `as_of` and
 writes `state/escalations/<eid>.json` with `status: "open"`.
 
 ```
@@ -445,8 +450,13 @@ $ coord escalations
 ```
 
 ### `coord resolve --id EID [--note TEXT]`
-Close an escalation: sets `status: "resolved"` and records an optional `--note`. It then drops
-off the `escalations` list. Fails (exit 1) on an unknown id.
+Close an escalation: sets `status: "resolved"` and records the human's answer in `--note`. The
+answer is **delivered back to the session that raised the escalation** (its `from` field) as a
+checkpoint message tied to the current `desired.version`, so that session picks up the decision
+at its next `coord checkpoint` — this is what makes `coord escalate --kind decision` a real
+stand-in for a direct human prompt. The escalation then drops off the `escalations` list. Fails
+(exit 1) on an unknown id. (A `tick`-authored escalation names no asking session, so no message
+is queued — only the operator-facing resolution is recorded.)
 
 ```
 $ coord resolve --id 1783452715807409000 --note "picked v3, staying put"

@@ -81,3 +81,21 @@ Prefer changing `desired` state over sending messages. When you must message dir
 - `coord send --from $ID --to <session> --body "<text>" --as-of <desired_version> --ttl <sec>`
 - Passing `--as-of` ties the message to a desired-state version so it auto-goes-stale once the
   world moves on — that is exactly why `checkpoint` can safely skip outdated messages.
+
+## Never prompt the human directly — escalate instead
+
+**Never open a direct human-prompt modal (e.g. the `ask_user` tool).** It blocks your session,
+and the cockpit the human watches cannot clear it — so every dispatch queued behind you stalls.
+(The `preToolUse` hook denies it wherever the runtime routes prompts through a tool hook.) When
+you genuinely need a human decision:
+
+1. Raise it and **yield the turn**:
+   `coord escalate --session $ID --kind decision --body "<the question, plus the options you see>"`.
+2. The human sees it in the cockpit (`coord cockpit` / `coord escalations`) and answers with
+   `coord resolve --id <eid> --note "<answer>"`.
+3. `resolve` delivers that answer back to you as a normal checkpoint message (tied to the
+   current `desired_version`), so you pick it up at your next `coord checkpoint` and continue.
+
+Escalate only when a decision is truly required — otherwise prefer reconciling to `desired`
+state. Use `--kind blocker` when you are stuck and cannot proceed, `--kind fork` when several
+valid paths exist and the human must choose.

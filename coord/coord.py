@@ -890,6 +890,18 @@ def cmd_resolve(a):
     esc["status"] = "resolved"
     esc["resolved_note"] = a.note
     _atomic_write(path, json.dumps(esc, indent=2))
+    # Close the decision loop: deliver the human's answer back to the session that
+    # raised the escalation, as a checkpoint message tied to the current desired
+    # version so it surfaces as fresh. This is what lets `coord escalate --kind
+    # decision` stand in for a direct human prompt -- the asking session receives the
+    # answer at its next `coord checkpoint` instead of blocking on a modal the cockpit
+    # cannot clear. `tick` is a pseudo-session (its blocker escalations are FYI to the
+    # human), so there is nobody there to answer.
+    asker = esc.get("from")
+    if asker and asker != "tick":
+        version = _read_json(_p("state", "desired.json"), {"version": 0}).get("version", 0)
+        answer = a.note if a.note else "(resolved with no note)"
+        _send_message("human", asker, f"escalation {a.id} resolved: {answer}", as_of=version)
     print(f"resolved {a.id}")
 
 

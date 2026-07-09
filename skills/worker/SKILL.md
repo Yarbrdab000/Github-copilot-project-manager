@@ -49,3 +49,8 @@ if it is `true` — you still hold a `claimed` task that is not `done` — **imm
 the next unit of work; do not yield the turn.** Only yield when: your task reaches `done`
 (`continue` goes `false`), a `stop` flag is set at checkpoint, or you must `escalate` (raise a
 `blocker`/`fork` and stop to await a decision). Do not sit idle mid-task waiting to be re-prompted.
+
+**Never open a human-prompt modal (`ask_user`) to ask a question — it blocks you and the cockpit
+cannot clear it.** Route every question to the human through `coord escalate` (see
+`coordination-protocol`); their answer comes back to you as a checkpoint message once they
+`coord resolve` it.
