@@ -105,6 +105,8 @@ def test_navigator_bash_denied(nav, command):
     "coord tasks",
     "coord plan analyze --file plan.json",
     "coord plan analyze --file plan.json --json",
+    "coord plan seams --root . --workers 3",
+    "coord plan seams --root . --json",
     "git status",
     "git log --oneline -5",
     "git diff",
