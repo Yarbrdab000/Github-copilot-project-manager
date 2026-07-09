@@ -1,20 +1,23 @@
 {
   "$schema": "https://json-schema.org/draft-07/schema",
   "name": "agent-coordination-skills",
-  "description": "File-based control plane for coordinating multiple Copilot CLI agents: atomic task claiming with dependency gating, leased resource locks with heartbeat-based reaping, checkpointed shared state, and staleness-filtered messaging. Ships a coordination-protocol skill, an orchestrator + worker skill pair, three scoped agents (orchestrator/researcher/editor), and a write-scope enforcement hook.",
-  "version": "0.1.0",
+  "description": "File-based control plane for coordinating multiple Copilot CLI agents: atomic task claiming with dependency gating, leased resource locks with heartbeat-based reaping, checkpointed shared state, and staleness-filtered messaging. Adds a navigator planner/cockpit that proposes human-approved plans, an autonomous reconcile loop (tick/run) with coded acceptance gates and escalations, five skills (coordination-protocol, orchestrator, worker, navigator, self-update), four scoped agents (orchestrator/researcher/editor/navigator), a write-scope enforcement hook, and an offline self-update helper.",
+  "version": "0.2.0",
   "license": "MIT",
   "repository": "https://github.com/Yarbrdab000/Github-copilot-project-manager",
   "keywords": ["coordination","multi-agent","orchestration","task-queue","locking","copilot","cli","control-plane","agents"],
   "skills": [
     "./skills/coordination-protocol",
     "./skills/orchestrator",
-    "./skills/worker"
+    "./skills/worker",
+    "./skills/navigator",
+    "./skills/self-update"
   ],
   "agents": [
     "./agents/orchestrator.agent.md",
     "./agents/researcher.agent.md",
-    "./agents/editor.agent.md"
+    "./agents/editor.agent.md",
+    "./agents/navigator.agent.md"
   ],
   "mcpServers": {}
 }
