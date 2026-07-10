@@ -256,7 +256,7 @@ plan 1783555685181644600  status=pending  as_of=0
     build-b              owned_by=w2  build B
 ```
 
-### `coord plan seams [--root DIR] [--workers N] [--json]`
+### `coord plan seams [--root DIR | --graph FILE] [--workers N] [--json]`
 Read-only **repo-partition suggester** — the generative complement to `plan analyze`. Instead of
 critiquing a plan you already wrote, it reads the repository's own **intra-repo import graph**
 (`--root`, default `.`) and suggests a partition of the tree into worker-owned path clusters
@@ -283,7 +283,31 @@ cross-seam coupling: 1 edges, weight 1 (minimize this)
   api(seam-2) <-> shared(seam-1)  x1  -- shared seam: pin this contract down first
 ```
 
-### `coord plan scaffold [--root DIR] [--workers N] [--max-concurrent M]`
+**Greenfield (`--graph FILE`, or `-` for stdin).** A brand-new project has no code to scan, so
+you declare the intended graph instead of `--root`-scanning one: a JSON object
+`{"modules": ["src/api", ...], "edges": [["src/api","src/store"(, weight)], ...]}`, where
+`modules` are the intended component directories and `edges` the intended dependencies (undirected
+coupling; optional integer weight, default 1 — a heavier weight keeps two components together
+under a forced cut). `coord` runs the *same* partition engine over the declaration, so a
+greenfield plan gets the identical isolation guarantee. Declared modules are validated as
+repo-relative paths, and a nested pair (`src` + `src/api`) is merged into one seam (you cannot
+isolate a parent directory from its child). `--graph` works identically on `plan scaffold`.
+
+```
+$ echo '{"modules":["src/api","src/store","src/web","src/docs"],
+         "edges":[["src/api","src/store"],["src/web","src/api"]]}' | coord plan seams --graph - --workers 2
+source=declared graph  modules=4  intended_edges=2
+natural_seams(zero-coupling components)=2  seams=2 (requested 2)
+  seam-1: files=3  internal_edges=2
+      src/api/**
+      src/store/**
+      src/web/**
+  seam-2: files=1  internal_edges=0
+      src/docs/**
+cross-seam coupling: 0 edges, weight 0 (minimize this)
+```
+
+### `coord plan scaffold [--root DIR | --graph FILE] [--workers N] [--max-concurrent M]`
 Read-only **plan generator** — the bridge from `plan seams` to `plan propose`. It runs the same
 repo partition as `seams` but, instead of a human-readable report, emits a **complete, valid plan
 document** on stdout: a `fleet` wired straight from the seams and one placeholder task per seam
@@ -295,7 +319,10 @@ worker), and every task carries a `verify` key (set to `null`) — so the pipeli
 plane. Redirect it to a file, replace each `"TODO: implement ..."` desc with the real work, add
 contracts-first prelude `deps` for any shared interface, then `analyze` and `propose`. `--workers
 N` scaffolds a coarser partition (same semantics as `seams`); `--max-concurrent M` sets the fleet
-cap independently of the seam count (default: the seam count).
+cap independently of the seam count (default: the seam count). For a greenfield project with no
+code to scan, pass `--graph FILE` (or `-` for stdin) instead of `--root` — a declared module graph
+`{"modules": [...], "edges": [...]}` (see `plan seams` above) run through the same engine to emit a
+valid greenfield plan.
 
 ```
 $ coord plan scaffold --root .

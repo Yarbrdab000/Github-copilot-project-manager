@@ -122,6 +122,55 @@ wave, no cross-worker deps). Your job is to add back only the coupling that genu
 the shared contracts — as explicit deps, and nothing more. `--workers N` scaffolds against a
 coarser partition; `--max-concurrent M` sets the fleet cap independently of the seam count.
 
+### Greenfield: no code to scan yet
+
+`seams` and `scaffold --root` read coupling from code that already exists. A brand-new project
+has nothing to scan — so **you** supply the graph. This is the one step `coord` can't do for you:
+turning a prose goal into components is reasoning, and `coord` is deterministic and offline. Do
+that reasoning, declare the result, and hand it back to the same engine via `--graph`:
+
+1. **Enumerate the capabilities** the goal names — the distinct things the system must *do*
+   (create/resolve links, persist them, a UI to manage them, a job to expire them).
+2. **Group them into components with clean boundaries.** Prefer **vertical slices** — a component
+   owns its whole stack (its API, logic, and storage access) — over **horizontal layers** (a
+   "controllers" worker, a "models" worker), which force every worker to touch every feature and
+   destroy isolation. Each component is a `module` = the directory it will live in.
+3. **Name the shared contracts.** Wherever two components must *agree* on something — an API
+   shape, a DB record, an event format — that is an intended dependency `edge` **and** a contract
+   to pin down before those components fork. Give a tighter coupling a heavier weight
+   (`["a","b",3]`) so a forced cut keeps them together.
+4. **Declare the graph and let `coord` partition it** — the same seams/scaffold engine, so the
+   greenfield plan gets the identical isolation guarantee (no overlapping owned-paths, valid doc):
+
+```
+cat > decl.json <<'JSON'
+{ "modules": ["src/api", "src/store", "src/web", "src/expiry"],
+  "edges":   [["src/api","src/store"], ["src/expiry","src/store"], ["src/web","src/api"]] }
+JSON
+coord plan seams --graph decl.json     # everything routes through store -> ONE coupled seam.
+                                       #   That collapse IS the signal: store is a hub, so its
+                                       #   record schema is the contract to pin FIRST.
+```
+
+When a shared component pulls everyone into a single seam, don't just accept one giant worker —
+**break the hub with a contract.** Model the hub as its own seam and let its dependents fork off
+it: scaffold at one-worker-per-module, then add the contracts-first deps (see *Analyze before you
+propose*), so the hub's interface is a wave-1 prelude and the rest run in parallel behind it.
+
+```
+coord plan scaffold --graph decl.json --workers 4 > plan.json   # one worker per component
+#   then edit plan.json: real task descs, and make src/store the wave-1 prelude that
+#   src/api and src/expiry depend on (src/web depends on src/api) -- so store's schema is
+#   settled once, up front, and api/expiry/web fork behind it.
+coord plan analyze --file plan.json    # confirm: wave 1 = store, then the dependents fan out
+coord plan propose --file plan.json
+```
+
+`--graph` takes a file path or `-` for stdin, and works on both `seams` and `scaffold`. The
+declaration is a *starting hypothesis*, not a spec: run `seams --graph` first to see which
+components are genuinely independent (free parallelism) versus which share a hub (a contract to
+resolve first), then refine the graph before you scaffold.
+
 ### Analyze before you propose
 
 `coord plan analyze --file <plan.json>` (read-only; also reads a document on stdin) shows a
