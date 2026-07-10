@@ -107,6 +107,8 @@ def test_navigator_bash_denied(nav, command):
     "coord plan analyze --file plan.json --json",
     "coord plan seams --root . --workers 3",
     "coord plan seams --root . --json",
+    "coord plan scaffold --root .",
+    "coord plan scaffold --root . --workers 3 --max-concurrent 2",
     "git status",
     "git log --oneline -5",
     "git diff",

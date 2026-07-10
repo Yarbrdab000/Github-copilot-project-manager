@@ -611,6 +611,8 @@ def cmd_plan(a):
         _plan_analyze_cmd(a)
     elif a.action == "seams":
         _plan_seams_cmd(a)
+    elif a.action == "scaffold":
+        _plan_scaffold_cmd(a)
 
 
 def _plan_propose(a):
@@ -1092,6 +1094,105 @@ def _plan_seams_cmd(a):
               f"-- shared seam: pin this contract down first")
     for n in r["notes"]:
         print(f"note: {n}")
+
+
+# --- work-routing: plan scaffold (`coord plan scaffold`) ---------------------
+# The bridge from `plan seams` to `plan propose`. `seams` tells you WHERE the isolated
+# boundaries are; `scaffold` turns that partition into a VALID, ready-to-edit plan
+# document -- fleet wired from the seams, one placeholder task per seam, deps empty
+# (maximally parallel, zero coupling to start). The navigator fills in real task
+# descriptions and the contracts-first deps, runs `plan analyze`, and proposes. It is
+# guaranteed to pass `_plan_validate` (no cross-worker owned-path overlap; every task
+# carries a `verify` key), so `coord plan scaffold --root . | coord plan analyze`
+# round-trips cleanly. Read-only.
+def _collapse_owned_paths(globs):
+    """Within a SINGLE worker, drop an owned-path glob a shallower one already covers
+    ('src/api/**' makes 'src/api/v2/**' redundant). Shallowest-first, deterministic."""
+    items = sorted({(_normalize_owned_glob(g), g) for g in globs})
+    items.sort(key=lambda it: (len([s for s in it[0].split("/") if s]), it[0]))
+    kept = []
+    for norm, g in items:
+        if any(_path_prefix_overlaps(k, norm) for k, _ in kept):
+            continue
+        kept.append((norm, g))
+    return sorted(g for _, g in kept)
+
+
+def _merge_nested_clusters(clusters):
+    """Union any clusters whose owned_paths would overlap across DISTINCT workers -- a
+    worker owning 'src' and another owning 'src/api' is both an illegal plan overlap and
+    impossible to isolate. Reuses the plan validator's own overlap test, so the scaffold
+    this feeds always passes `_plan_validate`. Deterministic."""
+    owned = [[_seam_owned_path(m) for m in ms] for ms in clusters]
+    parent = list(range(len(clusters)))
+
+    def find(x):
+        while parent[x] != x:
+            parent[x] = parent[parent[x]]
+            x = parent[x]
+        return x
+
+    for i in range(len(clusters)):
+        for j in range(i + 1, len(clusters)):
+            if _owned_paths_overlap(owned[i], owned[j]):
+                ri, rj = find(i), find(j)
+                if ri != rj:
+                    parent[max(ri, rj)] = min(ri, rj)
+
+    groups = {}
+    for i, ms in enumerate(clusters):
+        groups.setdefault(find(i), []).extend(ms)
+    return [sorted(set(g)) for g in groups.values()]
+
+
+def _plan_scaffold(files, edges, target_k=None, max_concurrent=None, root_label="."):
+    """Pure: turn a repo's seam partition into a VALID plan document (the shape
+    `plan propose`/`plan analyze` consume). Mirrors the `_plan_seams` split so the core
+    is unit-testable without the filesystem. One placeholder task per seam, owner wired,
+    deps empty. Writes nothing."""
+    modules, weights = _module_graph(files, edges)
+    clusters = _merge_nested_clusters(_agglomerate(modules, weights, target_k))
+
+    files_by_module = {}
+    for f in files:
+        files_by_module.setdefault(_seam_module_of(f), []).append(f)
+    clusters.sort(key=lambda ms: (-sum(len(files_by_module.get(m, [])) for m in ms), ms))
+
+    workers, tasks = [], []
+    for i, ms in enumerate(clusters):
+        sid = f"seam-{i + 1}"
+        owned = _collapse_owned_paths([_seam_owned_path(m) for m in ms])
+        workers.append({"id": sid, "owned_paths": owned})
+        tasks.append({
+            "id": f"{sid}-impl",
+            "desc": "TODO: implement " + ", ".join(owned),
+            "owned_by": sid,
+            "deps": [],
+            "verify": None,
+        })
+
+    mc = max_concurrent if (isinstance(max_concurrent, int) and not isinstance(max_concurrent, bool)
+                            and max_concurrent >= 1) else max(len(workers), 1)
+    note = (f"scaffold from {len(workers)} seam(s) over {root_label}: one placeholder task per "
+            "seam, no deps (max parallelism). Edit task desc/deps -- add contracts-first prelude "
+            "deps for any shared interface -- then `coord plan analyze` before proposing.")
+    return {"note": note, "fleet": {"max_concurrent": mc, "workers": workers}, "tasks": tasks}
+
+
+def _plan_scaffold_cmd(a):
+    """`coord plan scaffold [--root DIR] [--workers N] [--max-concurrent M]` -- emit a
+    valid plan document derived from the repo's seams to stdout, ready to pipe onward:
+    `coord plan scaffold --root . | coord plan analyze`, then edit and `plan propose`.
+    Read-only; writes nothing to the coordination plane."""
+    root_label = getattr(a, "root", None) or "."
+    files, edges = _scan_repo_graph(root_label)
+    doc = _plan_scaffold(
+        files, edges,
+        target_k=getattr(a, "workers", None),
+        max_concurrent=getattr(a, "max_concurrent", None),
+        root_label=root_label,
+    )
+    print(json.dumps(doc, indent=2))
 
 
 def _plan_approve(a):
@@ -1853,12 +1954,13 @@ def build_parser():
     sub.add_parser("tasks").set_defaults(func=cmd_tasks)
 
     pl = sub.add_parser("plan"); pl.set_defaults(func=cmd_plan)
-    pl.add_argument("action", choices=["propose", "show", "approve", "reject", "analyze", "seams"])
+    pl.add_argument("action", choices=["propose", "show", "approve", "reject", "analyze", "seams", "scaffold"])
     pl.add_argument("--file", help="path to a plan JSON document (default: read from stdin)")
     pl.add_argument("--id", help="plan id (pid) for `plan show`/`plan approve`/`plan reject`")
     pl.add_argument("--session", help="session id used as the state-lock holder for `plan approve`")
-    pl.add_argument("--root", help="repo root to analyze for `plan seams` (default: .)")
-    pl.add_argument("--workers", type=int, help="target seam count for `plan seams` (default: natural components)")
+    pl.add_argument("--root", help="repo root to analyze for `plan seams`/`plan scaffold` (default: .)")
+    pl.add_argument("--workers", type=int, help="target seam count for `plan seams`/`plan scaffold` (default: natural components)")
+    pl.add_argument("--max-concurrent", dest="max_concurrent", type=int, help="fleet.max_concurrent for `plan scaffold` (default: seam count)")
     pl.add_argument("--json", action="store_true", help="machine-readable output for `plan analyze`/`plan seams`")
 
     sub.add_parser("plans").set_defaults(func=cmd_plans)
