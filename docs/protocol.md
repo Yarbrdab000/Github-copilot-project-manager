@@ -283,6 +283,38 @@ cross-seam coupling: 1 edges, weight 1 (minimize this)
   api(seam-2) <-> shared(seam-1)  x1  -- shared seam: pin this contract down first
 ```
 
+### `coord plan scaffold [--root DIR] [--workers N] [--max-concurrent M]`
+Read-only **plan generator** — the bridge from `plan seams` to `plan propose`. It runs the same
+repo partition as `seams` but, instead of a human-readable report, emits a **complete, valid plan
+document** on stdout: a `fleet` wired straight from the seams and one placeholder task per seam
+with empty `deps`. The document is guaranteed to pass `plan propose`'s validation — worker
+`owned_paths` never overlap (nested modules like `src` and `src/api` are merged into a single
+worker), and every task carries a `verify` key (set to `null`) — so the pipeline round-trips:
+`coord plan scaffold --root . | coord plan analyze` reports one wave and zero cross-worker deps
+(the maximally-parallel, zero-coupling starting point). Writes nothing; needs no initialized
+plane. Redirect it to a file, replace each `"TODO: implement ..."` desc with the real work, add
+contracts-first prelude `deps` for any shared interface, then `analyze` and `propose`. `--workers
+N` scaffolds a coarser partition (same semantics as `seams`); `--max-concurrent M` sets the fleet
+cap independently of the seam count (default: the seam count).
+
+```
+$ coord plan scaffold --root .
+{
+  "note": "scaffold from 2 seam(s) over .: one placeholder task per seam, no deps ...",
+  "fleet": {
+    "max_concurrent": 2,
+    "workers": [
+      { "id": "seam-1", "owned_paths": ["api/**"] },
+      { "id": "seam-2", "owned_paths": ["ui/**"] }
+    ]
+  },
+  "tasks": [
+    { "id": "seam-1-impl", "desc": "TODO: implement api/**", "owned_by": "seam-1", "deps": [], "verify": null },
+    { "id": "seam-2-impl", "desc": "TODO: implement ui/**", "owned_by": "seam-2", "deps": [], "verify": null }
+  ]
+}
+```
+
 ### `coord plan analyze --file PLAN.json [--json]` (or pipe the plan document on stdin)
 Read-only **shape** analysis of a proposed plan — the work-routing signals a navigator uses to
 judge parallelism and worker isolation *before* proposing. Writes nothing. Reports the topological

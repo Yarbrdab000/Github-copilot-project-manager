@@ -99,6 +99,29 @@ worktree without waiting on another's output:
 C includes) and directory structure, so review its suggestion, fold in domain knowledge, then
 draft the plan and `analyze` it.
 
+### Scaffold the plan from the seams
+
+Don't hand-transcribe the seams output into plan JSON — let `coord plan scaffold [--root .]
+[--workers N] [--max-concurrent M]` (read-only) do it. It runs the same partition as `seams` and
+emits a **complete, valid plan document** on stdout: a fleet wired straight from the seams and one
+placeholder task per seam with empty deps. It is guaranteed to pass `plan propose`'s validation
+(no overlapping owned-paths — nested modules like `src` and `src/api` are merged into one worker —
+and every task carries a `verify` key), so the whole pipeline round-trips:
+
+```
+coord plan scaffold --root . | coord plan analyze          # sanity-check the shape
+coord plan scaffold --root . > plan.json                   # then edit plan.json:
+#   - replace each "TODO: implement ..." desc with the real work
+#   - add contracts-first prelude deps for any shared interface (see below)
+coord plan analyze --file plan.json                        # re-check after editing
+coord plan propose --file plan.json                        # hand the human one plan to approve
+```
+
+The scaffold is the **maximally-parallel, zero-coupling** starting point (`analyze` reports one
+wave, no cross-worker deps). Your job is to add back only the coupling that genuinely exists —
+the shared contracts — as explicit deps, and nothing more. `--workers N` scaffolds against a
+coarser partition; `--max-concurrent M` sets the fleet cap independently of the seam count.
+
 ### Analyze before you propose
 
 `coord plan analyze --file <plan.json>` (read-only; also reads a document on stdin) shows a
