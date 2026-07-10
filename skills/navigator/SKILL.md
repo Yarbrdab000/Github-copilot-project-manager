@@ -104,23 +104,31 @@ draft the plan and `analyze` it.
 Don't hand-transcribe the seams output into plan JSON — let `coord plan scaffold [--root .]
 [--workers N] [--max-concurrent M]` (read-only) do it. It runs the same partition as `seams` and
 emits a **complete, valid plan document** on stdout: a fleet wired straight from the seams and one
-placeholder task per seam with empty deps. It is guaranteed to pass `plan propose`'s validation
-(no overlapping owned-paths — nested modules like `src` and `src/api` are merged into one worker —
+placeholder task per seam. It is guaranteed to pass `plan propose`'s validation (no overlapping
+owned-paths — nested modules like `src` and `src/api` are merged into one worker — acyclic deps,
 and every task carries a `verify` key), so the whole pipeline round-trips:
 
 ```
 coord plan scaffold --root . | coord plan analyze          # sanity-check the shape
 coord plan scaffold --root . > plan.json                   # then edit plan.json:
 #   - replace each "TODO: implement ..." desc with the real work
-#   - add contracts-first prelude deps for any shared interface (see below)
+#   - for any auto-emitted "contract-*" prelude, set owned_by (see below)
 coord plan analyze --file plan.json                        # re-check after editing
 coord plan propose --file plan.json                        # hand the human one plan to approve
 ```
 
-The scaffold is the **maximally-parallel, zero-coupling** starting point (`analyze` reports one
-wave, no cross-worker deps). Your job is to add back only the coupling that genuinely exists —
-the shared contracts — as explicit deps, and nothing more. `--workers N` scaffolds against a
-coarser partition; `--max-concurrent M` sets the fleet cap independently of the seam count.
+For a naturally-decoupled partition the scaffold is the **maximally-parallel, zero-coupling**
+starting point (`analyze` reports one wave, no cross-worker deps). But when you ask for **more
+workers than there are naturally-independent seams** (`--workers N` forcing a split of a coupled
+component), `scaffold` is **contract-aware**: for every pair of seams the cut leaves coupled it
+emits one `contract-seam-i-seam-j` prelude task and makes both seams' impl tasks depend on it —
+turning coupling that would otherwise be silently dropped into an explicit **contracts-first
+wave-0**. Those preludes are deliberately left **unowned** (`owned_by: null`), because who
+*publishes* a shared interface is a design call, not something the partitioner can decide. So on a
+forced cut your job is narrow: fill in the real descriptions and **assign each contract an owner**
+before you propose (an unowned task never auto-dispatches to a cockpit fleet, so leaving one
+unowned strands its dependents). `--max-concurrent M` sets the fleet cap independently of the seam
+count.
 
 ### Greenfield: no code to scan yet
 
@@ -153,16 +161,19 @@ coord plan seams --graph decl.json     # everything routes through store -> ONE 
 ```
 
 When a shared component pulls everyone into a single seam, don't just accept one giant worker —
-**break the hub with a contract.** Model the hub as its own seam and let its dependents fork off
-it: scaffold at one-worker-per-module, then add the contracts-first deps (see *Analyze before you
-propose*), so the hub's interface is a wave-1 prelude and the rest run in parallel behind it.
+**break the hub with a contract.** Force one worker per module and let `scaffold` surface the hub's
+interfaces for you: on that forced cut it auto-emits an unowned `contract-*` prelude for every
+coupled seam pair and makes both sides wait on it, so the hub's schema is settled in wave-0 and the
+dependents fork behind it. You just assign each contract an owner (here, `src/store`'s worker):
 
 ```
 coord plan scaffold --graph decl.json --workers 4 > plan.json   # one worker per component
-#   then edit plan.json: real task descs, and make src/store the wave-1 prelude that
-#   src/api and src/expiry depend on (src/web depends on src/api) -- so store's schema is
-#   settled once, up front, and api/expiry/web fork behind it.
-coord plan analyze --file plan.json    # confirm: wave 1 = store, then the dependents fan out
+#   scaffold auto-adds three unowned preludes (store is seams 3): contract-seam-1-seam-3
+#   (api<->store), contract-seam-2-seam-3 (expiry<->store), contract-seam-1-seam-4 (api<->web),
+#   with api/expiry/web/store impls already wired to wait on the ones they touch.
+#   then edit plan.json: real task descs, and set each contract's owned_by to the seam that
+#   publishes it (the store contracts -> the src/store seam; the api<->web contract -> src/api).
+coord plan analyze --file plan.json    # wave 1 = the contracts, wave 2 = the impls fan out
 coord plan propose --file plan.json
 ```
 
