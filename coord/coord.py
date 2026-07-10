@@ -933,6 +933,90 @@ def _scan_repo_graph(root):
     return files, sorted(edge_set)
 
 
+# --- work-routing: greenfield declared-graph input --------------------------
+# `_scan_repo_graph` reads coupling from code that already exists. For a NEW project
+# there is nothing to scan yet -- so the navigator reasons the prose goal into an
+# intended module graph (components + the dependencies between them) and declares it.
+# `_load_declared_graph` turns that declaration into the SAME (files, edges) shape the
+# scanner produces, so `plan seams`/`plan scaffold` partition a greenfield project with
+# the identical isolation engine. The language understanding lives in the navigator;
+# the deterministic partition + valid-plan emit lives here.
+def _normalize_decl_module(raw):
+    """Normalize a navigator-declared module path to the shape `_seam_module_of` yields
+    ('./src/api/' -> 'src/api'; ''/root -> '.'), rejecting absolute or parent-escaping
+    paths so a declared module always maps to an in-repo owned-path glob."""
+    p = posixpath.normpath(str(raw).strip().replace("\\", "/"))
+    if p in ("", "."):
+        return "."
+    if p.startswith("/") or p == ".." or p.startswith("../"):
+        _die(f"declared module must be a repo-relative path (no absolute or '..' paths): {raw!r}")
+    return p
+
+
+def _load_declared_graph(spec):
+    """Turn a navigator-declared module graph into synthetic (files, edges) that
+    `_module_graph` rolls up to exactly the declared modules and edge weights -- the
+    GREENFIELD counterpart to `_scan_repo_graph`. `spec` is
+    {"modules": ["src/api", ...], "edges": [["src/api", "src/auth"(, weight)], ...]}:
+    `modules` are the intended component directories (each becomes an owned-path glob),
+    `edges` the intended dependencies (undirected coupling; optional integer weight,
+    default 1 -- a heavier weight keeps two components together under a forced cut).
+    Deterministic; validates strictly and `_die`s on malformed input."""
+    if not isinstance(spec, dict):
+        _die("declared graph must be a JSON object with 'modules' (and optional 'edges')")
+    raw_modules = spec.get("modules")
+    if not isinstance(raw_modules, list) or not raw_modules:
+        _die("declared graph 'modules' must be a non-empty list of repo-relative path strings")
+    modules, seen = [], set()
+    for m in raw_modules:
+        if not isinstance(m, str) or not m.strip():
+            _die(f"declared module must be a non-empty string: {m!r}")
+        norm = _normalize_decl_module(m)
+        if norm not in seen:
+            seen.add(norm)
+            modules.append(norm)
+    fileof = {m: ("__decl__" if m == "." else m + "/__decl__") for m in modules}
+    files = [fileof[m] for m in modules]
+
+    raw_edges = spec.get("edges")
+    if raw_edges is not None and not isinstance(raw_edges, list):
+        _die("declared graph 'edges' must be a list of [from, to] pairs (optional weight)")
+    edges = []
+    for e in raw_edges or []:
+        if not isinstance(e, (list, tuple)) or len(e) < 2:
+            _die(f"declared edge must be [from, to] with an optional weight: {e!r}")
+        a, b = _normalize_decl_module(e[0]), _normalize_decl_module(e[1])
+        for endpoint in (a, b):
+            if endpoint not in seen:
+                _die(f"declared edge references undeclared module {endpoint!r}; add it to 'modules'")
+        w = 1
+        if len(e) >= 3:
+            if isinstance(e[2], bool) or not isinstance(e[2], int):
+                _die(f"declared edge weight must be an integer >= 1: {e[2]!r}")
+            w = e[2]
+            if w < 1:
+                _die(f"declared edge weight must be >= 1: {w}")
+        if a != b:
+            edges.extend([tuple(sorted((fileof[a], fileof[b])))] * w)
+    return files, sorted(edges)
+
+
+def _read_graph_spec(path):
+    """Read a declared-graph JSON document from `path`, or from stdin when path is '-'."""
+    if path == "-":
+        raw = sys.stdin.read()
+    else:
+        try:
+            raw = Path(path).read_text(encoding="utf-8")
+        except OSError as e:
+            _die(f"cannot read declared graph {path!r}: {e}")
+            return None
+    try:
+        return json.loads(raw)
+    except json.JSONDecodeError as e:
+        _die(f"declared graph is not valid JSON: {e}")
+
+
 def _module_graph(files, edges):
     """Pure: roll file-level coupling up to directory 'modules'. Returns
     (modules, weights): `modules` = sorted unique module dirs; `weights` = dict keyed
@@ -1070,17 +1154,28 @@ def _plan_seams(files, edges, target_k=None, root_label="."):
 
 
 def _plan_seams_cmd(a):
-    """`coord plan seams [--root DIR] [--workers N] [--json]` -- read-only repo-partition
-    suggester. Scans `--root` (default '.') for intra-repo import coupling and prints a
-    seam partition a navigator can lift into a `plan propose` fleet. Writes nothing."""
-    root_label = getattr(a, "root", None) or "."
-    files, edges = _scan_repo_graph(root_label)
+    """`coord plan seams [--root DIR | --graph FILE] [--workers N] [--json]` -- read-only
+    repo-partition suggester. Scans `--root` (default '.') for intra-repo import coupling,
+    OR reads a navigator-declared module graph via `--graph FILE` (or `--graph -` for
+    stdin) for a greenfield project with no code to scan yet. Prints a seam partition a
+    navigator can lift into a `plan propose` fleet. Writes nothing."""
+    graph = getattr(a, "graph", None)
+    if graph:
+        files, edges = _load_declared_graph(_read_graph_spec(graph))
+        root_label = "<declared graph>"
+    else:
+        root_label = getattr(a, "root", None) or "."
+        files, edges = _scan_repo_graph(root_label)
     r = _plan_seams(files, edges, target_k=getattr(a, "workers", None), root_label=root_label)
     if getattr(a, "json", False):
         print(json.dumps(r, indent=2))
         return
-    print(f"root={r['root']}  files={r['file_count']}  modules={r['module_count']}  "
-          f"import_edges={r['file_edge_count']}")
+    if graph:
+        print(f"source=declared graph  modules={r['module_count']}  "
+              f"intended_edges={r['module_edge_count']}")
+    else:
+        print(f"root={r['root']}  files={r['file_count']}  modules={r['module_count']}  "
+              f"import_edges={r['file_edge_count']}")
     req = f" (requested {r['requested_workers']})" if r["requested_workers"] else ""
     print(f"natural_seams(zero-coupling components)={r['natural_seams']}  seams={r['workers']}{req}")
     for c in r["clusters"]:
@@ -1180,12 +1275,19 @@ def _plan_scaffold(files, edges, target_k=None, max_concurrent=None, root_label=
 
 
 def _plan_scaffold_cmd(a):
-    """`coord plan scaffold [--root DIR] [--workers N] [--max-concurrent M]` -- emit a
-    valid plan document derived from the repo's seams to stdout, ready to pipe onward:
+    """`coord plan scaffold [--root DIR | --graph FILE] [--workers N] [--max-concurrent M]`
+    -- emit a valid plan document to stdout, ready to pipe onward:
     `coord plan scaffold --root . | coord plan analyze`, then edit and `plan propose`.
-    Read-only; writes nothing to the coordination plane."""
-    root_label = getattr(a, "root", None) or "."
-    files, edges = _scan_repo_graph(root_label)
+    Derives the seams by scanning `--root` (default '.'), OR from a navigator-declared
+    module graph via `--graph FILE` (or `--graph -` for stdin) for a greenfield project
+    with no code to scan yet. Read-only; writes nothing to the coordination plane."""
+    graph = getattr(a, "graph", None)
+    if graph:
+        files, edges = _load_declared_graph(_read_graph_spec(graph))
+        root_label = "<declared graph>"
+    else:
+        root_label = getattr(a, "root", None) or "."
+        files, edges = _scan_repo_graph(root_label)
     doc = _plan_scaffold(
         files, edges,
         target_k=getattr(a, "workers", None),
@@ -1959,6 +2061,7 @@ def build_parser():
     pl.add_argument("--id", help="plan id (pid) for `plan show`/`plan approve`/`plan reject`")
     pl.add_argument("--session", help="session id used as the state-lock holder for `plan approve`")
     pl.add_argument("--root", help="repo root to analyze for `plan seams`/`plan scaffold` (default: .)")
+    pl.add_argument("--graph", help="declared module-graph JSON for greenfield `plan seams`/`plan scaffold` (a file path, or - for stdin); bypasses --root scanning")
     pl.add_argument("--workers", type=int, help="target seam count for `plan seams`/`plan scaffold` (default: natural components)")
     pl.add_argument("--max-concurrent", dest="max_concurrent", type=int, help="fleet.max_concurrent for `plan scaffold` (default: seam count)")
     pl.add_argument("--json", action="store_true", help="machine-readable output for `plan analyze`/`plan seams`")
