@@ -310,19 +310,27 @@ cross-seam coupling: 0 edges, weight 0 (minimize this)
 ### `coord plan scaffold [--root DIR | --graph FILE] [--workers N] [--max-concurrent M]`
 Read-only **plan generator** — the bridge from `plan seams` to `plan propose`. It runs the same
 repo partition as `seams` but, instead of a human-readable report, emits a **complete, valid plan
-document** on stdout: a `fleet` wired straight from the seams and one placeholder task per seam
-with empty `deps`. The document is guaranteed to pass `plan propose`'s validation — worker
-`owned_paths` never overlap (nested modules like `src` and `src/api` are merged into a single
-worker), and every task carries a `verify` key (set to `null`) — so the pipeline round-trips:
-`coord plan scaffold --root . | coord plan analyze` reports one wave and zero cross-worker deps
-(the maximally-parallel, zero-coupling starting point). Writes nothing; needs no initialized
-plane. Redirect it to a file, replace each `"TODO: implement ..."` desc with the real work, add
-contracts-first prelude `deps` for any shared interface, then `analyze` and `propose`. `--workers
-N` scaffolds a coarser partition (same semantics as `seams`); `--max-concurrent M` sets the fleet
-cap independently of the seam count (default: the seam count). For a greenfield project with no
-code to scan, pass `--graph FILE` (or `-` for stdin) instead of `--root` — a declared module graph
-`{"modules": [...], "edges": [...]}` (see `plan seams` above) run through the same engine to emit a
-valid greenfield plan.
+document** on stdout: a `fleet` wired straight from the seams and one placeholder task per seam.
+The document is guaranteed to pass `plan propose`'s validation — worker `owned_paths` never overlap
+(nested modules like `src` and `src/api` are merged into a single worker), deps are acyclic, and
+every task carries a `verify` key (set to `null`) — so the pipeline round-trips: for a naturally
+decoupled partition `coord plan scaffold --root . | coord plan analyze` reports one wave and zero
+cross-worker deps (the maximally-parallel, zero-coupling starting point). Writes nothing; needs no
+initialized plane. Redirect it to a file, replace each `"TODO: implement ..."` desc with the real
+work, then `analyze` and `propose`. `--max-concurrent M` sets the fleet cap independently of the
+seam count (default: the seam count). For a greenfield project with no code to scan, pass `--graph
+FILE` (or `-` for stdin) instead of `--root` — a declared module graph `{"modules": [...], "edges":
+[...]}` (see `plan seams` above) run through the same engine to emit a valid greenfield plan.
+
+**Contract-aware forced cuts.** `--workers N` scaffolds a coarser or finer partition (same
+semantics as `seams`). Asking for *fewer* workers than natural seams merges independent components
+(still no coupling). Asking for *more* — forcing a split of a coupled component — leaves real
+coupling between two seams. Rather than drop it, `scaffold` emits one **unowned** `contract-seam-i-
+seam-j` prelude task per coupled seam pair and makes both seams' impl tasks depend on it: an
+explicit **contracts-first wave-0**. The prelude is left `owned_by: null` on purpose — who publishes
+a shared interface is a design decision, so assign each contract an owner (and a real desc) before
+proposing. `analyze` sees these preludes as high-fan-in prelude candidates with **zero** cross-
+worker deps (an unowned boundary object is not a worker-to-worker leak).
 
 ```
 $ coord plan scaffold --root .
@@ -338,6 +346,20 @@ $ coord plan scaffold --root .
   "tasks": [
     { "id": "seam-1-impl", "desc": "TODO: implement api/**", "owned_by": "seam-1", "deps": [], "verify": null },
     { "id": "seam-2-impl", "desc": "TODO: implement ui/**", "owned_by": "seam-2", "deps": [], "verify": null }
+  ]
+}
+
+# A forced cut of one coupled component (api <-> store) surfaces the shared contract:
+$ echo '{"modules":["api","store"],"edges":[["api","store"]]}' | coord plan scaffold --graph - --workers 2
+{
+  "note": "scaffold from 2 seam(s) over <declared graph>: a forced cut left 1 cross-seam contract(s). Each is an UNOWNED prelude (assign owned_by ...) that both coupled seams wait on. ...",
+  "fleet": { "max_concurrent": 2, "workers": [
+      { "id": "seam-1", "owned_paths": ["api/**"] },
+      { "id": "seam-2", "owned_paths": ["store/**"] } ] },
+  "tasks": [
+    { "id": "contract-seam-1-seam-2", "desc": "CONTRACT shared by seam-1 and seam-2 (coupling weight 1): ...", "owned_by": null, "deps": [], "verify": null },
+    { "id": "seam-1-impl", "desc": "TODO: implement api/**", "owned_by": "seam-1", "deps": ["contract-seam-1-seam-2"], "verify": null },
+    { "id": "seam-2-impl", "desc": "TODO: implement store/**", "owned_by": "seam-2", "deps": ["contract-seam-1-seam-2"], "verify": null }
   ]
 }
 ```

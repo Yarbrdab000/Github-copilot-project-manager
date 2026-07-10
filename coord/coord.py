@@ -1194,12 +1194,17 @@ def _plan_seams_cmd(a):
 # --- work-routing: plan scaffold (`coord plan scaffold`) ---------------------
 # The bridge from `plan seams` to `plan propose`. `seams` tells you WHERE the isolated
 # boundaries are; `scaffold` turns that partition into a VALID, ready-to-edit plan
-# document -- fleet wired from the seams, one placeholder task per seam, deps empty
-# (maximally parallel, zero coupling to start). The navigator fills in real task
-# descriptions and the contracts-first deps, runs `plan analyze`, and proposes. It is
-# guaranteed to pass `_plan_validate` (no cross-worker owned-path overlap; every task
-# carries a `verify` key), so `coord plan scaffold --root . | coord plan analyze`
-# round-trips cleanly. Read-only.
+# document -- fleet wired from the seams, one placeholder task per seam. When the
+# partition is naturally decoupled (or under-split), task deps are empty (maximally
+# parallel, zero coupling to start). When a forced `--workers N` cut splits a coupled
+# component, `scaffold` is CONTRACT-AWARE: for every pair of seams the cut left coupled
+# it emits one unowned "contract" prelude task and makes both seams' impl tasks depend
+# on it -- turning coupling that would otherwise be dropped on the floor into an explicit
+# contracts-first wave-0. The navigator fills in real task descriptions, assigns each
+# contract an owner, runs `plan analyze`, and proposes. It is guaranteed to pass
+# `_plan_validate` (no cross-worker owned-path overlap; acyclic deps; every task carries a
+# `verify` key), so `coord plan scaffold --root . | coord plan analyze` round-trips
+# cleanly. Read-only.
 def _collapse_owned_paths(globs):
     """Within a SINGLE worker, drop an owned-path glob a shallower one already covers
     ('src/api/**' makes 'src/api/v2/**' redundant). Shallowest-first, deterministic."""
@@ -1243,8 +1248,15 @@ def _merge_nested_clusters(clusters):
 def _plan_scaffold(files, edges, target_k=None, max_concurrent=None, root_label="."):
     """Pure: turn a repo's seam partition into a VALID plan document (the shape
     `plan propose`/`plan analyze` consume). Mirrors the `_plan_seams` split so the core
-    is unit-testable without the filesystem. One placeholder task per seam, owner wired,
-    deps empty. Writes nothing."""
+    is unit-testable without the filesystem. One placeholder task per seam, owner wired.
+
+    CONTRACT-AWARE: cross-seam coupling only survives a forced `--workers N` cut (a
+    natural or under-split partition leaves zero edges between seams). For each pair of
+    seams the cut left coupled, emit ONE shared "contract" prelude task -- unowned
+    (`owned_by: null`), because a boundary interface belongs to neither worker's private
+    worktree until a human decides who publishes it -- and make BOTH coupled seams' impl
+    tasks depend on it. Multiple module edges crossing the same seam pair collapse to a
+    single contract. Writes nothing."""
     modules, weights = _module_graph(files, edges)
     clusters = _merge_nested_clusters(_agglomerate(modules, weights, target_k))
 
@@ -1253,24 +1265,64 @@ def _plan_scaffold(files, edges, target_k=None, max_concurrent=None, root_label=
         files_by_module.setdefault(_seam_module_of(f), []).append(f)
     clusters.sort(key=lambda ms: (-sum(len(files_by_module.get(m, [])) for m in ms), ms))
 
-    workers, tasks = [], []
+    module_to_seam = {m: i for i, ms in enumerate(clusters) for m in ms}
+
+    # Roll every module edge that crosses a seam boundary up to the (seam_i, seam_j) pair
+    # it connects, summing weights, so N crossing module edges become ONE shared contract
+    # between the two workers.
+    pair_weight = {}
+    for (a, b), w in weights.items():
+        sa, sb = module_to_seam.get(a), module_to_seam.get(b)
+        if sa is None or sb is None or sa == sb:
+            continue
+        key = (min(sa, sb), max(sa, sb))
+        pair_weight[key] = pair_weight.get(key, 0) + w
+
+    workers = []
+    contract_deps = {i: [] for i in range(len(clusters))}
     for i, ms in enumerate(clusters):
-        sid = f"seam-{i + 1}"
         owned = _collapse_owned_paths([_seam_owned_path(m) for m in ms])
-        workers.append({"id": sid, "owned_paths": owned})
-        tasks.append({
-            "id": f"{sid}-impl",
-            "desc": "TODO: implement " + ", ".join(owned),
-            "owned_by": sid,
+        workers.append({"id": f"seam-{i + 1}", "owned_paths": owned})
+
+    contracts = []
+    for (i, j) in sorted(pair_weight):
+        cid = f"contract-seam-{i + 1}-seam-{j + 1}"
+        contracts.append({
+            "id": cid,
+            "desc": (f"CONTRACT shared by seam-{i + 1} and seam-{j + 1} (coupling weight "
+                     f"{pair_weight[(i, j)]}): define the interface both seams depend on FIRST, "
+                     "then set owned_by to whichever seam will publish it."),
+            "owned_by": None,
             "deps": [],
             "verify": None,
         })
+        contract_deps[i].append(cid)
+        contract_deps[j].append(cid)
 
+    impls = []
+    for i, w in enumerate(workers):
+        sid = w["id"]
+        impls.append({
+            "id": f"{sid}-impl",
+            "desc": "TODO: implement " + ", ".join(w["owned_paths"]),
+            "owned_by": sid,
+            "deps": sorted(contract_deps[i]),
+            "verify": None,
+        })
+
+    tasks = contracts + impls
     mc = max_concurrent if (isinstance(max_concurrent, int) and not isinstance(max_concurrent, bool)
                             and max_concurrent >= 1) else max(len(workers), 1)
-    note = (f"scaffold from {len(workers)} seam(s) over {root_label}: one placeholder task per "
-            "seam, no deps (max parallelism). Edit task desc/deps -- add contracts-first prelude "
-            "deps for any shared interface -- then `coord plan analyze` before proposing.")
+    if contracts:
+        note = (f"scaffold from {len(workers)} seam(s) over {root_label}: a forced cut left "
+                f"{len(contracts)} cross-seam contract(s). Each is an UNOWNED prelude (assign "
+                "owned_by to whichever seam publishes it) that both coupled seams wait on. Fill "
+                "in task desc, assign every contract an owner, then `coord plan analyze` before "
+                "proposing.")
+    else:
+        note = (f"scaffold from {len(workers)} seam(s) over {root_label}: one placeholder task per "
+                "seam, no deps (max parallelism). Edit task desc/deps -- add contracts-first prelude "
+                "deps for any shared interface -- then `coord plan analyze` before proposing.")
     return {"note": note, "fleet": {"max_concurrent": mc, "workers": workers}, "tasks": tasks}
 
 
